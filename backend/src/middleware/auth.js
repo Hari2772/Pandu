@@ -3,142 +3,76 @@ const User = require('../models/User');
 const redisManager = require('../config/redis');
 const logger = require('../utils/logger');
 
-// Authentication middleware
-const authenticate = async (req, res, next) => {
+// JWT token verification middleware
+const authenticateToken = async (req, res, next) => {
   try {
-    // Get token from header
     const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+
+    if (!token) {
       return res.status(401).json({
         success: false,
         message: 'Access token required'
       });
     }
 
-    const token = authHeader.substring(7); // Remove 'Bearer ' prefix
-
-    // Check Redis cache first
-    const cachedUser = await redisManager.getClient().get(`token:${token}`);
-    if (cachedUser) {
-      req.user = JSON.parse(cachedUser);
-      return next();
-    }
-
     // Verify JWT token
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     
     // Check if user exists and is active
-    const user = await User.findById(decoded.id)
-      .select('-password -emailVerificationToken -passwordResetToken');
-
-    if (!user) {
+    const user = await User.findById(decoded.id).select('_id username displayName email role isActive isDeleted tier');
+    
+    if (!user || !user.isActive || user.isDeleted) {
       return res.status(401).json({
         success: false,
-        message: 'User not found'
+        message: 'Invalid or inactive user account'
       });
     }
 
-    if (!user.isActive) {
+    // Check if token is blacklisted in Redis
+    const isBlacklisted = await redisManager.getClient().get(`blacklist:${token}`);
+    if (isBlacklisted) {
       return res.status(401).json({
         success: false,
-        message: 'Account is deactivated'
+        message: 'Token has been revoked'
       });
     }
 
-    // Cache user data in Redis for 5 minutes
-    const userData = {
+    // Attach user to request
+    req.user = {
       id: user._id,
       username: user.username,
       displayName: user.displayName,
       email: user.email,
       role: user.role,
-      tier: user.tier,
-      isEmailVerified: user.isEmailVerified
+      tier: user.tier
     };
 
-    await redisManager.getClient().setex(
-      `token:${token}`,
-      300, // 5 minutes
-      JSON.stringify(userData)
-    );
+    // Update last active timestamp
+    await User.findByIdAndUpdate(user._id, {
+      lastActiveDate: new Date()
+    });
 
-    req.user = userData;
     next();
 
   } catch (error) {
-    logger.error('Authentication error:', error);
-
     if (error.name === 'JsonWebTokenError') {
       return res.status(401).json({
         success: false,
         message: 'Invalid token'
       });
-    }
-
-    if (error.name === 'TokenExpiredError') {
+    } else if (error.name === 'TokenExpiredError') {
       return res.status(401).json({
         success: false,
         message: 'Token expired'
       });
+    } else {
+      logger.error('Authentication error:', error);
+      return res.status(500).json({
+        success: false,
+        message: 'Authentication failed'
+      });
     }
-
-    return res.status(500).json({
-      success: false,
-      message: 'Authentication failed'
-    });
-  }
-};
-
-// Optional authentication middleware (doesn't fail if no token)
-const optionalAuth = async (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization;
-    
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return next(); // Continue without authentication
-    }
-
-    const token = authHeader.substring(7);
-
-    // Check Redis cache first
-    const cachedUser = await redisManager.getClient().get(`token:${token}`);
-    if (cachedUser) {
-      req.user = JSON.parse(cachedUser);
-      return next();
-    }
-
-    // Verify JWT token
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    
-    const user = await User.findById(decoded.id)
-      .select('-password -emailVerificationToken -passwordResetToken');
-
-    if (user && user.isActive) {
-      const userData = {
-        id: user._id,
-        username: user.username,
-        displayName: user.displayName,
-        email: user.email,
-        role: user.role,
-        tier: user.tier,
-        isEmailVerified: user.isEmailVerified
-      };
-
-      await redisManager.getClient().setex(
-        `token:${token}`,
-        300,
-        JSON.stringify(userData)
-      );
-
-      req.user = userData;
-    }
-
-    next();
-
-  } catch (error) {
-    // Don't fail on authentication errors for optional auth
-    logger.debug('Optional authentication error:', error);
-    next();
   }
 };
 
@@ -152,22 +86,21 @@ const requireRole = (roles) => {
       });
     }
 
-    if (!roles.includes(req.user.role)) {
+    const userRole = req.user.role;
+    const allowedRoles = Array.isArray(roles) ? roles : [roles];
+
+    if (!allowedRoles.includes(userRole)) {
       return res.status(403).json({
         success: false,
-        message: 'Insufficient permissions'
+        message: 'Insufficient permissions',
+        required: allowedRoles,
+        current: userRole
       });
     }
 
     next();
   };
 };
-
-// Admin access middleware
-const requireAdmin = requireRole(['admin', 'super_admin']);
-
-// Super admin access middleware
-const requireSuperAdmin = requireRole(['super_admin']);
 
 // Tier-based access control middleware
 const requireTier = (minTier) => {
@@ -179,10 +112,14 @@ const requireTier = (minTier) => {
       });
     }
 
-    if (req.user.tier < minTier) {
+    const userTier = req.user.tier || 0;
+
+    if (userTier < minTier) {
       return res.status(403).json({
         success: false,
-        message: `Minimum tier ${minTier} required`
+        message: 'Insufficient tier level',
+        required: minTier,
+        current: userTier
       });
     }
 
@@ -190,102 +127,157 @@ const requireTier = (minTier) => {
   };
 };
 
-// Feature flag middleware
-const requireFeature = (featureName) => {
-  return async (req, res, next) => {
-    try {
-      if (!req.user) {
-        return res.status(401).json({
-          success: false,
-          message: 'Authentication required'
-        });
-      }
+// Optional authentication middleware (for public routes that can show different content for authenticated users)
+const optionalAuth = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+    const token = authHeader && authHeader.split(' ')[1];
 
-      // Check if feature is enabled for user
-      const FeatureFlag = require('../models/FeatureFlag');
-      const feature = await FeatureFlag.findOne({ name: featureName });
-
-      if (!feature || !feature.isEnabled) {
-        return res.status(403).json({
-          success: false,
-          message: 'Feature not available'
-        });
-      }
-
-      // Check rollout percentage
-      if (feature.rolloutPercentage < 100) {
-        const userHash = require('crypto')
-          .createHash('md5')
-          .update(req.user.id.toString())
-          .digest('hex');
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const user = await User.findById(decoded.id).select('_id username displayName email role isActive tier');
         
-        const userRollout = parseInt(userHash.substring(0, 8), 16) % 100;
-        
-        if (userRollout >= feature.rolloutPercentage) {
-          return res.status(403).json({
-            success: false,
-            message: 'Feature not available for your account'
-          });
+        if (user && user.isActive && !user.isDeleted) {
+          req.user = {
+            id: user._id,
+            username: user.username,
+            displayName: user.displayName,
+            email: user.email,
+            role: user.role,
+            tier: user.tier
+          };
         }
+      } catch (error) {
+        // Token is invalid, but we continue without authentication
+        logger.debug('Optional auth failed:', error.message);
       }
-
-      // Check dependencies
-      if (feature.dependencies && feature.dependencies.length > 0) {
-        for (const dep of feature.dependencies) {
-          const depFeature = await FeatureFlag.findOne({ name: dep });
-          if (!depFeature || !depFeature.isEnabled) {
-            return res.status(403).json({
-              success: false,
-              message: `Feature dependency '${dep}' not available`
-            });
-          }
-        }
-      }
-
-      next();
-
-    } catch (error) {
-      logger.error('Feature flag check error:', error);
-      return res.status(500).json({
-        success: false,
-        message: 'Feature availability check failed'
-      });
     }
-  };
+
+    next();
+  } catch (error) {
+    logger.error('Optional authentication error:', error);
+    next(); // Continue without authentication
+  }
 };
 
-// Rate limiting middleware for specific endpoints
-const rateLimit = (maxRequests, windowMs) => {
-  const requests = new Map();
+// API key authentication middleware
+const authenticateApiKey = async (req, res, next) => {
+  try {
+    const apiKey = req.headers['x-api-key'] || req.query.apiKey;
 
-  return (req, res, next) => {
-    const key = req.ip || req.connection.remoteAddress;
-    const now = Date.now();
-    const windowStart = now - windowMs;
-
-    // Clean up old requests
-    if (requests.has(key)) {
-      requests.set(key, requests.get(key).filter(timestamp => timestamp > windowStart));
+    if (!apiKey) {
+      return res.status(401).json({
+        success: false,
+        message: 'API key required'
+      });
     }
 
-    const userRequests = requests.get(key) || [];
+    // Check if API key exists and is valid
+    const validApiKey = await redisManager.getClient().get(`apikey:${apiKey}`);
     
-    if (userRequests.length >= maxRequests) {
+    if (!validApiKey) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid API key'
+      });
+    }
+
+    // Parse API key data
+    const apiKeyData = JSON.parse(validApiKey);
+    
+    // Check if API key is expired
+    if (apiKeyData.expiresAt && new Date() > new Date(apiKeyData.expiresAt)) {
+      return res.status(401).json({
+        success: false,
+        message: 'API key expired'
+      });
+    }
+
+    // Check rate limits
+    const rateLimitKey = `rate_limit:${apiKey}`;
+    const currentUsage = await redisManager.getClient().get(rateLimitKey);
+    
+    if (currentUsage && parseInt(currentUsage) >= apiKeyData.rateLimit) {
       return res.status(429).json({
         success: false,
-        message: 'Too many requests, please try again later'
+        message: 'Rate limit exceeded',
+        limit: apiKeyData.rateLimit,
+        resetTime: await redisManager.getClient().ttl(rateLimitKey)
       });
     }
 
-    userRequests.push(now);
-    requests.set(key, userRequests);
+    // Increment rate limit counter
+    await redisManager.getClient().incr(rateLimitKey);
+    await redisManager.getClient().expire(rateLimitKey, 3600); // Reset every hour
+
+    // Attach API key data to request
+    req.apiKey = apiKeyData;
+    req.user = {
+      id: apiKeyData.userId,
+      username: apiKeyData.username,
+      role: 'api_user',
+      tier: apiKeyData.tier || 0
+    };
 
     next();
-  };
+
+  } catch (error) {
+    logger.error('API key authentication error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Authentication failed'
+    });
+  }
 };
 
-// Session validation middleware
-const validateSession = async (req, res, next) => {
+// Session-based authentication middleware (for web admin panel)
+const authenticateSession = async (req, res, next) => {
+  try {
+    if (!req.session || !req.session.userId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Session authentication required'
+      });
+    }
+
+    const user = await User.findById(req.session.userId).select('_id username displayName email role isActive isDeleted tier');
+    
+    if (!user || !user.isActive || user.isDeleted) {
+      // Clear invalid session
+      req.session.destroy();
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid or expired session'
+      });
+    }
+
+    // Attach user to request
+    req.user = {
+      id: user._id,
+      username: user.username,
+      displayName: user.displayName,
+      email: user.email,
+      role: user.role,
+      tier: user.tier
+    };
+
+    // Extend session
+    req.session.touch();
+
+    next();
+
+  } catch (error) {
+    logger.error('Session authentication error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Authentication failed'
+    });
+  }
+};
+
+// Two-factor authentication middleware
+const require2FA = async (req, res, next) => {
   try {
     if (!req.user) {
       return res.status(401).json({
@@ -294,78 +286,102 @@ const validateSession = async (req, res, next) => {
       });
     }
 
-    // Check if user session is still valid in database
-    const user = await User.findById(req.user.id).select('isActive lastSeen');
+    const user = await User.findById(req.user.id).select('twoFactorEnabled twoFactorVerified');
     
-    if (!user || !user.isActive) {
-      // Clear cached token
-      const authHeader = req.headers.authorization;
-      if (authHeader) {
-        const token = authHeader.substring(7);
-        await redisManager.getClient().del(`token:${token}`);
-      }
-
-      return res.status(401).json({
+    if (user.twoFactorEnabled && !user.twoFactorVerified) {
+      return res.status(403).json({
         success: false,
-        message: 'Session expired or invalid'
+        message: 'Two-factor authentication required',
+        requires2FA: true
       });
-    }
-
-    // Update last seen
-    if (user.lastSeen) {
-      const timeDiff = Date.now() - user.lastSeen.getTime();
-      if (timeDiff > 30 * 60 * 1000) { // 30 minutes
-        await User.findByIdAndUpdate(req.user.id, { lastSeen: new Date() });
-      }
     }
 
     next();
 
   } catch (error) {
-    logger.error('Session validation error:', error);
+    logger.error('2FA check error:', error);
     return res.status(500).json({
       success: false,
-      message: 'Session validation failed'
+      message: 'Two-factor authentication check failed'
     });
   }
 };
 
-// Device fingerprinting middleware (optional)
-const deviceFingerprint = (req, res, next) => {
+// Device verification middleware
+const requireDeviceVerification = async (req, res, next) => {
   try {
-    const fingerprint = req.headers['x-device-fingerprint'] || 
-                       req.headers['user-agent'] || 
-                       req.ip;
+    if (!req.user) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required'
+      });
+    }
 
-    if (fingerprint) {
-      req.deviceFingerprint = fingerprint;
+    const deviceId = req.headers['x-device-id'] || req.body.deviceId;
+    
+    if (!deviceId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Device ID required'
+      });
+    }
+
+    // Check if device is verified for this user
+    const user = await User.findById(req.user.id).select('verifiedDevices');
+    const device = user.verifiedDevices.find(d => d.deviceId === deviceId);
+    
+    if (!device || !device.isVerified) {
+      return res.status(403).json({
+        success: false,
+        message: 'Device verification required',
+        requiresDeviceVerification: true,
+        deviceId
+      });
+    }
+
+    // Attach device info to request
+    req.device = device;
+    next();
+
+  } catch (error) {
+    logger.error('Device verification error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Device verification check failed'
+    });
+  }
+};
+
+// Logout middleware (blacklist token)
+const logout = async (req, res, next) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    
+    if (token) {
+      // Add token to blacklist with expiration
+      const decoded = jwt.decode(token);
+      const expiresIn = decoded.exp - Math.floor(Date.now() / 1000);
+      
+      if (expiresIn > 0) {
+        await redisManager.getClient().setex(`blacklist:${token}`, expiresIn, 'revoked');
+      }
     }
 
     next();
   } catch (error) {
-    logger.debug('Device fingerprinting error:', error);
-    next();
+    logger.error('Logout middleware error:', error);
+    next(); // Continue even if blacklisting fails
   }
-};
-
-// Logging middleware for authenticated requests
-const logAuthenticatedRequest = (req, res, next) => {
-  if (req.user) {
-    logger.info(`Authenticated request: ${req.method} ${req.path} by user ${req.user.username} (${req.user.id})`);
-  }
-  next();
 };
 
 module.exports = {
-  authenticate,
-  optionalAuth,
+  authenticateToken,
   requireRole,
-  requireAdmin,
-  requireSuperAdmin,
   requireTier,
-  requireFeature,
-  rateLimit,
-  validateSession,
-  deviceFingerprint,
-  logAuthenticatedRequest
+  optionalAuth,
+  authenticateApiKey,
+  authenticateSession,
+  require2FA,
+  requireDeviceVerification,
+  logout
 };
