@@ -1,322 +1,509 @@
 const express = require('express');
 const router = express.Router();
-const ChatController = require('../controllers/ChatController');
-const { authenticateToken } = require('../middleware/auth');
-const { validateRequest } = require('../middleware/validation');
-const { rateLimit } = require('../middleware/rateLimit');
-const { upload } = require('../middleware/upload');
+const ChatService = require('../services/ChatService');
+const { authenticateToken, authorizeRole } = require('../middleware/auth');
+const { validateChatData, validateMessageData } = require('../middleware/validation');
+const { rateLimiter } = require('../middleware/rateLimiter');
+const logger = require('../utils/logger');
 
-// Chat Routes
-router.post('/create', 
-  authenticateToken, 
-  rateLimit('chat', 10, 60000), // 10 requests per minute
-  validateRequest(['participantIds']),
-  ChatController.createChat
-);
+const chatService = new ChatService();
 
-router.post('/group/create',
-  authenticateToken,
-  rateLimit('chat', 5, 300000), // 5 requests per 5 minutes
-  validateRequest(['groupName', 'participantIds']),
-  ChatController.createGroupChat
-);
+// Apply rate limiting to all chat routes
+router.use(rateLimiter('chat', 100, 60)); // 100 requests per minute
 
-router.get('/list',
-  authenticateToken,
-  rateLimit('chat', 30, 60000), // 30 requests per minute
-  ChatController.getChats
-);
+// Get user's chats
+router.get('/', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { page = 1, limit = 20, type } = req.query;
 
-router.get('/:chatId',
-  authenticateToken,
-  rateLimit('chat', 60, 60000), // 60 requests per minute
-  ChatController.getChat
-);
+    const chats = await chatService.getUserChats(userId, {
+      page: parseInt(page),
+      limit: parseInt(limit),
+      type
+    });
 
-router.get('/:chatId/messages',
-  authenticateToken,
-  rateLimit('chat', 100, 60000), // 100 requests per minute
-  ChatController.getMessages
-);
+    res.json({
+      success: true,
+      data: {
+        chats,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total: chats.length
+        }
+      }
+    });
 
-router.post('/:chatId/messages',
-  authenticateToken,
-  rateLimit('chat', 20, 60000), // 20 requests per minute
-  upload.array('attachments', 5), // Max 5 attachments
-  validateRequest(['content']),
-  ChatController.sendMessage
-);
+  } catch (error) {
+    logger.error('Get user chats error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to get chats',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
 
-router.put('/:chatId/messages/:messageId',
-  authenticateToken,
-  rateLimit('chat', 10, 60000), // 10 requests per minute
-  validateRequest(['content']),
-  ChatController.updateMessage
-);
+// Create or get direct chat
+router.post('/direct', authenticateToken, validateChatData, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { targetUserId } = req.body;
 
-router.delete('/:chatId/messages/:messageId',
-  authenticateToken,
-  rateLimit('chat', 10, 60000), // 10 requests per minute
-  ChatController.deleteMessage
-);
+    if (!targetUserId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Target user ID is required'
+      });
+    }
 
-router.post('/:chatId/messages/:messageId/read',
-  authenticateToken,
-  rateLimit('chat', 50, 60000), // 50 requests per minute
-  ChatController.markMessageAsRead
-);
+    if (userId === targetUserId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot create chat with yourself'
+      });
+    }
 
-router.post('/:chatId/participants',
-  authenticateToken,
-  rateLimit('chat', 10, 300000), // 10 requests per 5 minutes
-  validateRequest(['userId']),
-  ChatController.addParticipant
-);
+    const chat = await chatService.getOrCreateDirectChat(userId, targetUserId);
 
-router.delete('/:chatId/participants/:userId',
-  authenticateToken,
-  rateLimit('chat', 10, 300000), // 10 requests per 5 minutes
-  ChatController.removeParticipant
-);
+    res.json({
+      success: true,
+      message: 'Direct chat created/retrieved successfully',
+      data: { chat }
+    });
 
-router.put('/:chatId/participants/:userId/role',
-  authenticateToken,
-  rateLimit('chat', 10, 300000), // 10 requests per 5 minutes
-  validateRequest(['role']),
-  ChatController.updateParticipantRole
-);
+  } catch (error) {
+    logger.error('Create direct chat error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create direct chat',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
 
-router.post('/:chatId/typing',
-  authenticateToken,
-  rateLimit('chat', 30, 60000), // 30 requests per minute
-  validateRequest(['isTyping']),
-  ChatController.setTypingStatus
-);
+// Create group chat
+router.post('/group', authenticateToken, validateChatData, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { name, description, participants, isPrivate = false, avatar } = req.body;
 
-router.get('/:chatId/typing',
-  authenticateToken,
-  rateLimit('chat', 60, 60000), // 60 requests per minute
-  ChatController.getTypingUsers
-);
+    if (!name || !participants || participants.length < 1) {
+      return res.status(400).json({
+        success: false,
+        message: 'Group name and at least one participant are required'
+      });
+    }
 
-router.get('/:chatId/stats',
-  authenticateToken,
-  rateLimit('chat', 20, 300000), // 20 requests per 5 minutes
-  ChatController.getChatStats
-);
+    // Add creator to participants if not already included
+    if (!participants.includes(userId)) {
+      participants.push(userId);
+    }
 
-router.post('/:chatId/archive',
-  authenticateToken,
-  rateLimit('chat', 5, 300000), // 5 requests per 5 minutes
-  ChatController.archiveChat
-);
+    const result = await chatService.createGroupChat(userId, {
+      name,
+      description,
+      participants,
+      isPrivate,
+      avatar
+    });
 
-router.post('/:chatId/unarchive',
-  authenticateToken,
-  rateLimit('chat', 5, 300000), // 5 requests per 5 minutes
-  ChatController.unarchiveChat
-);
+    res.status(201).json({
+      success: true,
+      message: 'Group chat created successfully',
+      data: result
+    });
 
-router.delete('/:chatId',
-  authenticateToken,
-  rateLimit('chat', 3, 600000), // 3 requests per 10 minutes
-  ChatController.deleteChat
-);
+  } catch (error) {
+    logger.error('Create group chat error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create group chat',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
 
-// Search Routes
-router.get('/search/global',
-  authenticateToken,
-  rateLimit('chat', 20, 60000), // 20 requests per minute
-  ChatController.searchGlobal
-);
+// Get chat by ID
+router.get('/:chatId', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId } = req.params;
 
-router.get('/search/messages',
-  authenticateToken,
-  rateLimit('chat', 30, 60000), // 30 requests per minute
-  ChatController.searchMessages
-);
+    const chat = await chatService.getChatById(chatId);
+    if (!chat) {
+      return res.status(404).json({
+        success: false,
+        message: 'Chat not found'
+      });
+    }
 
-// Group Chat Specific Routes
-router.put('/group/:groupId/settings',
-  authenticateToken,
-  rateLimit('chat', 5, 300000), // 5 requests per 5 minutes
-  ChatController.updateGroupSettings
-);
+    // Check if user is participant
+    if (!chat.participants.includes(userId)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied to this chat'
+      });
+    }
 
-router.post('/group/:groupId/invite',
-  authenticateToken,
-  rateLimit('chat', 10, 300000), // 10 requests per 5 minutes
-  validateRequest(['invitees']),
-  ChatController.inviteToGroup
-);
+    res.json({
+      success: true,
+      data: { chat }
+    });
 
-router.post('/group/:groupId/join',
-  authenticateToken,
-  rateLimit('chat', 10, 300000), // 10 requests per 5 minutes
-  ChatController.joinGroup
-);
+  } catch (error) {
+    logger.error('Get chat error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to get chat',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
 
-router.post('/group/:groupId/leave',
-  authenticateToken,
-  rateLimit('chat', 5, 300000), // 5 requests per 5 minutes
-  ChatController.leaveGroup
-);
+// Get chat messages
+router.get('/:chatId/messages', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId } = req.params;
+    const { page = 1, limit = 50, before, after, messageType } = req.query;
 
-// Message Reactions
-router.post('/:chatId/messages/:messageId/reactions',
-  authenticateToken,
-  rateLimit('chat', 20, 60000), // 20 requests per minute
-  validateRequest(['reaction']),
-  ChatController.addReaction
-);
+    const messages = await chatService.getChatMessages(chatId, userId, {
+      page: parseInt(page),
+      limit: parseInt(limit),
+      before,
+      after,
+      messageType
+    });
 
-router.delete('/:chatId/messages/:messageId/reactions/:reaction',
-  authenticateToken,
-  rateLimit('chat', 20, 60000), // 20 requests per minute
-  ChatController.removeReaction
-);
+    res.json({
+      success: true,
+      data: {
+        messages,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          hasMore: messages.length === parseInt(limit)
+        }
+      }
+    });
 
-// Message Threading
-router.post('/:chatId/messages/:messageId/reply',
-  authenticateToken,
-  rateLimit('chat', 20, 60000), // 20 requests per minute
-  validateRequest(['content']),
-  ChatController.replyToMessage
-);
+  } catch (error) {
+    logger.error('Get chat messages error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to get messages',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
 
-router.get('/:chatId/messages/:messageId/replies',
-  authenticateToken,
-  rateLimit('chat', 50, 60000), // 50 requests per minute
-  ChatController.getMessageReplies
-);
+// Send message
+router.post('/:chatId/messages', authenticateToken, validateMessageData, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId } = req.params;
+    const { content, messageType = 'text', replyTo, attachments } = req.body;
 
-// Chat Notifications
-router.put('/:chatId/notifications',
-  authenticateToken,
-  rateLimit('chat', 10, 300000), // 10 requests per 5 minutes
-  validateRequest(['enabled']),
-  ChatController.updateNotificationSettings
-);
+    const message = await chatService.sendMessage(chatId, userId, {
+      content,
+      messageType,
+      replyTo,
+      attachments
+    });
 
-router.get('/:chatId/notifications',
-  authenticateToken,
-  rateLimit('chat', 30, 60000), // 30 requests per minute
-  ChatController.getNotificationSettings
-);
+    res.status(201).json({
+      success: true,
+      message: 'Message sent successfully',
+      data: { message }
+    });
 
-// Chat Media
-router.get('/:chatId/media',
-  authenticateToken,
-  rateLimit('chat', 30, 60000), // 30 requests per minute
-  ChatController.getChatMedia
-);
+  } catch (error) {
+    logger.error('Send message error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to send message',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
 
-router.get('/:chatId/media/:mediaType',
-  authenticateToken,
-  rateLimit('chat', 50, 60000), // 50 requests per minute
-  ChatController.getChatMediaByType
-);
+// Update message
+router.put('/:chatId/messages/:messageId', authenticateToken, validateMessageData, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId, messageId } = req.params;
+    const { content, attachments, metadata } = req.body;
 
-// Chat Analytics
-router.get('/:chatId/analytics',
-  authenticateToken,
-  rateLimit('chat', 10, 300000), // 10 requests per 5 minutes
-  ChatController.getChatAnalytics
-);
+    const message = await chatService.updateMessage(messageId, userId, {
+      content,
+      attachments,
+      metadata
+    });
 
-router.get('/:chatId/analytics/messages',
-  authenticateToken,
-  rateLimit('chat', 20, 300000), // 20 requests per 5 minutes
-  ChatController.getMessageAnalytics
-);
+    res.json({
+      success: true,
+      message: 'Message updated successfully',
+      data: { message }
+    });
 
-router.get('/:chatId/analytics/participants',
-  authenticateToken,
-  rateLimit('chat', 20, 300000), // 20 requests per 5 minutes
-  ChatController.getParticipantAnalytics
-);
+  } catch (error) {
+    logger.error('Update message error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update message',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
 
-// Bulk Operations
-router.post('/bulk/read',
-  authenticateToken,
-  rateLimit('chat', 10, 300000), // 10 requests per 5 minutes
-  validateRequest(['chatIds']),
-  ChatController.markMultipleChatsAsRead
-);
+// Delete message
+router.delete('/:chatId/messages/:messageId', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { messageId } = req.params;
 
-router.post('/bulk/archive',
-  authenticateToken,
-  rateLimit('chat', 5, 600000), // 5 requests per 10 minutes
-  validateRequest(['chatIds']),
-  ChatController.archiveMultipleChats
-);
+    const message = await chatService.deleteMessage(messageId, userId);
 
-// Chat Export
-router.get('/:chatId/export',
-  authenticateToken,
-  rateLimit('chat', 3, 600000), // 3 requests per 10 minutes
-  ChatController.exportChat
-);
+    res.json({
+      success: true,
+      message: 'Message deleted successfully',
+      data: { message }
+    });
 
-// Chat Backup
-router.post('/:chatId/backup',
-  authenticateToken,
-  rateLimit('chat', 2, 900000), // 2 requests per 15 minutes
-  ChatController.createChatBackup
-);
+  } catch (error) {
+    logger.error('Delete message error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to delete message',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
 
-router.get('/:chatId/backup/:backupId',
-  authenticateToken,
-  rateLimit('chat', 5, 300000), // 5 requests per 5 minutes
-  ChatController.getChatBackup
-);
+// Mark messages as read
+router.post('/:chatId/read', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId } = req.params;
+    const { messageIds } = req.body;
 
-// Chat Templates
-router.get('/templates',
-  authenticateToken,
-  rateLimit('chat', 20, 60000), // 20 requests per minute
-  ChatController.getChatTemplates
-);
+    if (!messageIds || !Array.isArray(messageIds)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Message IDs array is required'
+      });
+    }
 
-router.post('/templates',
-  authenticateToken,
-  rateLimit('chat', 5, 300000), // 5 requests per 5 minutes
-  validateRequest(['name', 'template']),
-  ChatController.createChatTemplate
-);
+    await chatService.markMessagesAsRead(chatId, userId, messageIds);
 
-router.put('/templates/:templateId',
-  authenticateToken,
-  rateLimit('chat', 5, 300000), // 5 requests per 5 minutes
-  validateRequest(['name', 'template']),
-  ChatController.updateChatTemplate
-);
+    res.json({
+      success: true,
+      message: 'Messages marked as read successfully'
+    });
 
-router.delete('/templates/:templateId',
-  authenticateToken,
-  rateLimit('chat', 5, 300000), // 5 requests per 5 minutes
-  ChatController.deleteChatTemplate
-);
+  } catch (error) {
+    logger.error('Mark messages as read error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to mark messages as read',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
 
-// Chat Moderation
-router.post('/:chatId/moderate',
-  authenticateToken,
-  rateLimit('chat', 10, 300000), // 10 requests per 5 minutes
-  validateRequest(['action', 'reason']),
-  ChatController.moderateChat
-);
+// Search messages
+router.get('/:chatId/search', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId } = req.params;
+    const { query, page = 1, limit = 20, messageType, startDate, endDate } = req.query;
 
-router.get('/:chatId/moderation/logs',
-  authenticateToken,
-  rateLimit('chat', 20, 300000), // 20 requests per 5 minutes
-  ChatController.getModerationLogs
-);
+    if (!query) {
+      return res.status(400).json({
+        success: false,
+        message: 'Search query is required'
+      });
+    }
 
-// Chat Health Check
-router.get('/health/status',
-  authenticateToken,
-  rateLimit('chat', 30, 60000), // 30 requests per minute
-  ChatController.getHealthStatus
-);
+    const messages = await chatService.searchMessages(userId, query, {
+      chatId,
+      page: parseInt(page),
+      limit: parseInt(limit),
+      messageType,
+      startDate: startDate ? new Date(startDate) : null,
+      endDate: endDate ? new Date(endDate) : null
+    });
+
+    res.json({
+      success: true,
+      data: {
+        messages,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          hasMore: messages.length === parseInt(limit)
+        }
+      }
+    });
+
+  } catch (error) {
+    logger.error('Search messages error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to search messages',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Add participant to group chat
+router.post('/:chatId/participants', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId } = req.params;
+    const { participantId } = req.body;
+
+    if (!participantId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Participant ID is required'
+      });
+    }
+
+    const result = await chatService.addParticipantToGroup(chatId, participantId, userId);
+
+    res.json({
+      success: true,
+      message: 'Participant added successfully',
+      data: result
+    });
+
+  } catch (error) {
+    logger.error('Add participant error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to add participant',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Remove participant from group chat
+router.delete('/:chatId/participants/:participantId', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId, participantId } = req.params;
+
+    const result = await chatService.removeParticipantFromGroup(chatId, participantId, userId);
+
+    res.json({
+      success: true,
+      message: 'Participant removed successfully',
+      data: result
+    });
+
+  } catch (error) {
+    logger.error('Remove participant error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to remove participant',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Get chat statistics
+router.get('/:chatId/stats', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId } = req.params;
+
+    const stats = await chatService.getChatStats(chatId, userId);
+
+    res.json({
+      success: true,
+      data: { stats }
+    });
+
+  } catch (error) {
+    logger.error('Get chat stats error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to get chat statistics',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Archive chat
+router.post('/:chatId/archive', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId } = req.params;
+
+    await chatService.archiveChat(chatId, userId);
+
+    res.json({
+      success: true,
+      message: 'Chat archived successfully'
+    });
+
+  } catch (error) {
+    logger.error('Archive chat error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to archive chat',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Unarchive chat
+router.post('/:chatId/unarchive', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId } = req.params;
+
+    await chatService.unarchiveChat(chatId, userId);
+
+    res.json({
+      success: true,
+      message: 'Chat unarchived successfully'
+    });
+
+  } catch (error) {
+    logger.error('Unarchive chat error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to unarchive chat',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Leave group chat
+router.post('/:chatId/leave', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId } = req.params;
+
+    await chatService.leaveGroupChat(chatId, userId);
+
+    res.json({
+      success: true,
+      message: 'Left group chat successfully'
+    });
+
+  } catch (error) {
+    logger.error('Leave group chat error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to leave group chat',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
 
 module.exports = router;

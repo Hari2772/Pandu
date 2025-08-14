@@ -6,13 +6,13 @@ const authRoutes = require('./auth');
 const userRoutes = require('./user');
 const chatRoutes = require('./chat');
 const callRoutes = require('./call');
-const storyRoutes = require('./story');
-const groupRoutes = require('./group');
 const discoveryRoutes = require('./discovery');
+const groupRoutes = require('./group');
+const storyRoutes = require('./story');
 const adminRoutes = require('./admin');
 const analyticsRoutes = require('./analytics');
 
-// Health check endpoint
+// Health check route
 router.get('/health', (req, res) => {
   res.json({
     status: 'OK',
@@ -26,8 +26,8 @@ router.get('/health', (req, res) => {
 router.get('/version', (req, res) => {
   res.json({
     version: process.env.APP_VERSION || '1.0.0',
-    build: process.env.BUILD_NUMBER || 'dev',
-    timestamp: new Date().toISOString()
+    apiVersion: 'v1',
+    buildDate: process.env.BUILD_DATE || new Date().toISOString()
   });
 });
 
@@ -36,9 +36,9 @@ router.use('/auth', authRoutes);
 router.use('/users', userRoutes);
 router.use('/chats', chatRoutes);
 router.use('/calls', callRoutes);
-router.use('/stories', storyRoutes);
-router.use('/groups', groupRoutes);
 router.use('/discovery', discoveryRoutes);
+router.use('/groups', groupRoutes);
+router.use('/stories', storyRoutes);
 router.use('/admin', adminRoutes);
 router.use('/analytics', analyticsRoutes);
 
@@ -46,7 +46,7 @@ router.use('/analytics', analyticsRoutes);
 router.use('*', (req, res) => {
   res.status(404).json({
     success: false,
-    message: 'Route not found',
+    message: 'API endpoint not found',
     path: req.originalUrl,
     method: req.method
   });

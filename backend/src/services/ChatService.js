@@ -2,255 +2,124 @@ const Chat = require('../models/Chat');
 const Message = require('../models/Message');
 const User = require('../models/User');
 const Group = require('../models/Group');
-const Analytics = require('../models/Analytics');
 const redisManager = require('../config/redis');
 const logger = require('../utils/logger');
-const constants = require('../utils/constants');
 
 class ChatService {
   constructor() {
-    this.messageCache = new Map(); // chatId -> recent messages
-    this.userTyping = new Map(); // chatId -> Set of typing users
-    this.unreadCounts = new Map(); // userId -> Map of chatId -> count
+    this.activeChats = new Map(); // chatId -> chat data
+    this.userChats = new Map(); // userId -> [chatIds]
   }
 
-  // Chat Management
-  async createChat(participantIds, chatType = 'direct', metadata = {}) {
+  // Create or get direct chat
+  async getOrCreateDirectChat(userId1, userId2) {
     try {
-      // Validate participants
-      if (participantIds.length < 2) {
-        throw new Error('At least 2 participants required');
-      }
+      // Check if chat already exists
+      let chat = await Chat.findOne({
+        type: 'direct',
+        participants: { $all: [userId1, userId2] },
+        isActive: true
+      });
 
-      // Check if direct chat already exists
-      if (chatType === 'direct' && participantIds.length === 2) {
-        const existingChat = await Chat.findOne({
+      if (!chat) {
+        // Create new chat
+        chat = new Chat({
           type: 'direct',
-          'participants.userId': { $all: participantIds },
-          'participants.status': 'active'
+          participants: [userId1, userId2],
+          createdBy: userId1,
+          isActive: true
         });
 
-        if (existingChat) {
-          return existingChat;
-        }
+        await chat.save();
+
+        // Update user chat mappings
+        this.addUserToChat(userId1, chat._id);
+        this.addUserToChat(userId2, chat._id);
+
+        logger.info(`New direct chat created: ${chat._id} between ${userId1} and ${userId2}`);
       }
 
-      // Create chat
-      const chat = new Chat({
-        type: chatType,
-        participants: participantIds.map(userId => ({
-          userId,
-          status: 'active',
-          joinedAt: new Date(),
-          role: 'member'
-        })),
-        metadata,
-        lastMessageAt: new Date()
-      });
-
-      await chat.save();
-
-      // Initialize cache
-      this.messageCache.set(chat._id.toString(), []);
-      this.userTyping.set(chat._id.toString(), new Set());
-      this.initializeUnreadCounts(chat._id, participantIds);
-
-      // Track analytics
-      await Analytics.create({
-        eventType: 'group_created',
-        eventName: 'Chat Created',
-        eventCategory: 'communication',
-        userId: participantIds[0],
-        platform: 'service',
-        metadata: {
-          chatId: chat._id,
-          chatType,
-          participantCount: participantIds.length
-        }
-      });
-
-      logger.info(`Chat created: ${chat._id} (${chatType}) with ${participantIds.length} participants`);
       return chat;
-
     } catch (error) {
-      logger.error('Create chat error:', error);
+      logger.error('Get or create direct chat error:', error);
       throw error;
     }
   }
 
-  async createGroupChat(creatorId, groupName, participantIds, description = '', avatar = null) {
+  // Create group chat
+  async createGroupChat(creatorId, groupData) {
     try {
+      const { name, description, participants, isPrivate, avatar } = groupData;
+
+      // Validate participants
+      if (!participants || participants.length < 2) {
+        throw new Error('Group must have at least 2 participants');
+      }
+
+      // Add creator to participants if not already included
+      if (!participants.includes(creatorId)) {
+        participants.push(creatorId);
+      }
+
       // Create group
       const group = new Group({
-        name: groupName,
+        name,
         description,
-        avatar,
-        creatorId,
-        members: participantIds.map(userId => ({
+        creator: creatorId,
+        members: participants.map(userId => ({
           userId,
-          role: userId.toString() === creatorId.toString() ? 'admin' : 'member',
-          status: 'active',
+          role: userId === creatorId ? 'admin' : 'member',
           joinedAt: new Date()
         })),
-        settings: {
-          allowMemberInvites: true,
-          requireAdminApproval: false,
-          allowMemberEditing: false
-        }
+        isPrivate,
+        avatar
       });
 
       await group.save();
 
-      // Create group chat
-      const chat = await this.createChat(participantIds, 'group', {
+      // Create chat for group
+      const chat = new Chat({
+        type: 'group',
         groupId: group._id,
-        groupName: group.name,
-        groupDescription: group.description
+        participants,
+        createdBy: creatorId,
+        isActive: true
       });
 
-      // Track analytics
-      await Analytics.create({
-        eventType: 'group_created',
-        eventName: 'Group Chat Created',
-        eventCategory: 'social',
-        userId: creatorId,
-        platform: 'service',
-        metadata: {
-          groupId: group._id,
-          chatId: chat._id,
-          participantCount: participantIds.length
-        }
+      await chat.save();
+
+      // Update user chat mappings
+      participants.forEach(userId => {
+        this.addUserToChat(userId, chat._id);
       });
 
-      logger.info(`Group chat created: ${group.name} (${group._id}) with ${participantIds.length} members`);
-      return { group, chat };
+      // Populate chat data
+      await chat.populate('groupId');
+      await chat.populate('participants', 'username displayName profilePicture');
 
+      logger.info(`New group chat created: ${chat._id} by ${creatorId}`);
+
+      return { chat, group };
     } catch (error) {
       logger.error('Create group chat error:', error);
       throw error;
     }
   }
 
-  async addParticipantToChat(chatId, userId, addedBy, role = 'member') {
+  // Send message
+  async sendMessage(chatId, senderId, messageData) {
     try {
+      const { content, messageType = 'text', replyTo, attachments, metadata } = messageData;
+
+      // Validate chat
       const chat = await Chat.findById(chatId);
-      if (!chat) {
-        throw new Error('Chat not found');
+      if (!chat || !chat.isActive) {
+        throw new Error('Chat not found or inactive');
       }
 
-      // Check if user is already a participant
-      const existingParticipant = chat.participants.find(
-        p => p.userId.toString() === userId.toString()
-      );
-
-      if (existingParticipant) {
-        if (existingParticipant.status === 'active') {
-          throw new Error('User is already an active participant');
-        }
-        // Reactivate user
-        existingParticipant.status = 'active';
-        existingParticipant.role = role;
-        existingParticipant.joinedAt = new Date();
-      } else {
-        // Add new participant
-        chat.participants.push({
-          userId,
-          status: 'active',
-          joinedAt: new Date(),
-          role
-        });
-      }
-
-      await chat.save();
-
-      // Initialize unread count for new participant
-      this.initializeUnreadCounts(chatId, [userId]);
-
-      // Track analytics
-      await Analytics.create({
-        eventType: 'group_joined',
-        eventName: 'User Added to Chat',
-        eventCategory: 'social',
-        userId: addedBy,
-        platform: 'service',
-        metadata: {
-          chatId,
-          addedUserId: userId,
-          role
-        }
-      });
-
-      logger.info(`User ${userId} added to chat ${chatId} by ${addedBy}`);
-      return chat;
-
-    } catch (error) {
-      logger.error('Add participant to chat error:', error);
-      throw error;
-    }
-  }
-
-  async removeParticipantFromChat(chatId, userId, removedBy) {
-    try {
-      const chat = await Chat.findById(chatId);
-      if (!chat) {
-        throw new Error('Chat not found');
-      }
-
-      const participant = chat.participants.find(
-        p => p.userId.toString() === userId.toString()
-      );
-
-      if (!participant) {
-        throw new Error('User is not a participant in this chat');
-      }
-
-      // Soft remove participant
-      participant.status = 'removed';
-      participant.removedAt = new Date();
-      participant.removedBy = removedBy;
-
-      await chat.save();
-
-      // Remove from unread counts
-      this.removeUnreadCount(chatId, userId);
-
-      // Track analytics
-      await Analytics.create({
-        eventType: 'group_left',
-        eventName: 'User Removed from Chat',
-        eventCategory: 'social',
-        userId: removedBy,
-        platform: 'service',
-        metadata: {
-          chatId,
-          removedUserId: userId
-        }
-      });
-
-      logger.info(`User ${userId} removed from chat ${chatId} by ${removedBy}`);
-      return chat;
-
-    } catch (error) {
-      logger.error('Remove participant from chat error:', error);
-      throw error;
-    }
-  }
-
-  // Message Management
-  async sendMessage(chatId, senderId, content, messageType = 'text', replyTo = null, attachments = []) {
-    try {
-      // Validate chat access
-      const chat = await Chat.findById(chatId);
-      if (!chat) {
-        throw new Error('Chat not found');
-      }
-
-      const participant = chat.participants.find(
-        p => p.userId.toString() === senderId.toString() && p.status === 'active'
-      );
-
-      if (!participant) {
-        throw new Error('User is not an active participant in this chat');
+      // Check if user is participant
+      if (!chat.participants.includes(senderId)) {
+        throw new Error('User not authorized to send message in this chat');
       }
 
       // Create message
@@ -261,156 +130,192 @@ class ChatService {
         messageType,
         replyTo,
         attachments,
-        metadata: {
-          participantRole: participant.role,
-          chatType: chat.type
-        }
+        metadata
       });
 
       await message.save();
 
-      // Update chat
-      chat.lastMessage = message._id;
-      chat.lastMessageAt = new Date();
-      chat.messageCount = (chat.messageCount || 0) + 1;
-
-      // Update unread counts for other participants
-      chat.participants.forEach(p => {
-        if (p.userId.toString() !== senderId.toString() && p.status === 'active') {
-          this.incrementUnreadCount(chatId, p.userId);
-        }
+      // Update chat last message
+      await Chat.findByIdAndUpdate(chatId, {
+        lastMessage: message._id,
+        lastMessageAt: new Date(),
+        lastMessageBy: senderId,
+        messageCount: { $inc: 1 }
       });
 
-      await chat.save();
+      // Populate sender info
+      await message.populate('senderId', 'username displayName profilePicture');
 
-      // Add to cache
-      this.addMessageToCache(chatId, message);
+      // Cache message in Redis
+      await this.cacheMessage(chatId, message);
 
-      // Track analytics
-      await Analytics.create({
-        eventType: 'message_sent',
-        eventName: 'Message Sent',
-        eventCategory: 'communication',
-        userId: senderId,
-        platform: 'service',
-        metadata: {
-          chatId,
-          messageId: message._id,
-          messageType,
-          hasAttachments: attachments.length > 0,
-          isReply: !!replyTo,
-          chatType: chat.type
-        }
-      });
+      // Update active chats
+      this.updateActiveChat(chatId, message);
 
-      logger.info(`Message sent: ${message._id} in chat ${chatId} by ${senderId}`);
+      logger.info(`Message sent in chat ${chatId} by user ${senderId}`);
+
       return message;
-
     } catch (error) {
       logger.error('Send message error:', error);
       throw error;
     }
   }
 
-  async getMessages(chatId, userId, options = {}) {
+  // Get chat messages
+  async getChatMessages(chatId, userId, options = {}) {
     try {
-      const { page = 1, limit = 50, before = null, after = null } = options;
+      const { page = 1, limit = 50, before, after, messageType } = options;
 
       // Validate chat access
       const chat = await Chat.findById(chatId);
-      if (!chat) {
-        throw new Error('Chat not found');
+      if (!chat || !chat.isActive) {
+        throw new Error('Chat not found or inactive');
       }
 
-      const participant = chat.participants.find(
-        p => p.userId.toString() === userId.toString() && p.status === 'active'
-      );
-
-      if (!participant) {
-        throw new Error('User is not an active participant in this chat');
+      if (!chat.participants.includes(userId)) {
+        throw new Error('User not authorized to access this chat');
       }
 
       // Build query
       let query = { chatId };
+      if (messageType) query.messageType = messageType;
       if (before) query._id = { $lt: before };
       if (after) query._id = { $gt: after };
 
       // Get messages
       const messages = await Message.find(query)
-        .sort({ _id: -1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
         .populate('senderId', 'username displayName profilePicture')
-        .populate('replyTo', 'content messageType senderId')
-        .lean();
+        .populate('replyTo', 'content messageType')
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit);
 
       // Mark messages as read
-      await this.markMessagesAsRead(chatId, userId);
-
-      // Track analytics
-      await Analytics.create({
-        eventType: 'message_read',
-        eventName: 'Messages Retrieved',
-        eventCategory: 'communication',
-        userId,
-        platform: 'service',
-        metadata: {
-          chatId,
-          messageCount: messages.length,
-          page,
-          limit
-        }
-      });
+      await this.markMessagesAsRead(chatId, userId, messages.map(m => m._id));
 
       return messages.reverse(); // Return in chronological order
-
     } catch (error) {
-      logger.error('Get messages error:', error);
+      logger.error('Get chat messages error:', error);
       throw error;
     }
   }
 
-  async markMessagesAsRead(chatId, userId) {
+  // Mark messages as read
+  async markMessagesAsRead(chatId, userId, messageIds) {
     try {
-      // Mark messages as read
-      const result = await Message.updateMany(
+      if (!messageIds || messageIds.length === 0) return;
+
+      // Update messages
+      await Message.updateMany(
         {
-          chatId,
+          _id: { $in: messageIds },
           senderId: { $ne: userId },
           readBy: { $ne: userId }
         },
         {
-          $addToSet: { readBy: userId },
-          readAt: new Date()
+          $push: { readBy: { userId, readAt: new Date() } }
         }
       );
 
-      if (result.modifiedCount > 0) {
-        // Reset unread count for this chat
-        this.resetUnreadCount(chatId, userId);
-
-        // Track analytics
-        await Analytics.create({
-          eventType: 'message_read',
-          eventName: 'Messages Marked as Read',
-          eventCategory: 'communication',
-          userId,
-          platform: 'service',
-          metadata: {
-            chatId,
-            messageCount: result.modifiedCount
-          }
-        });
-      }
-
-      return result.modifiedCount;
+      // Update chat unread count
+      await Chat.findByIdAndUpdate(chatId, {
+        $inc: { unreadCount: -1 }
+      });
 
     } catch (error) {
       logger.error('Mark messages as read error:', error);
+    }
+  }
+
+  // Get user chats
+  async getUserChats(userId, options = {}) {
+    try {
+      const { page = 1, limit = 20, type } = options;
+
+      // Build query
+      let query = {
+        participants: userId,
+        isActive: true
+      };
+
+      if (type) query.type = type;
+
+      // Get chats
+      const chats = await Chat.find(query)
+        .populate('participants', 'username displayName profilePicture isOnline lastSeen')
+        .populate('lastMessage')
+        .populate('groupId', 'name description avatar')
+        .sort({ lastMessageAt: -1, updatedAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit);
+
+      // Get unread counts
+      const chatsWithUnread = await Promise.all(
+        chats.map(async (chat) => {
+          const unreadCount = await Message.countDocuments({
+            chatId: chat._id,
+            senderId: { $ne: userId },
+            readBy: { $ne: userId }
+          });
+
+          return {
+            ...chat.toObject(),
+            unreadCount
+          };
+        })
+      );
+
+      return chatsWithUnread;
+    } catch (error) {
+      logger.error('Get user chats error:', error);
       throw error;
     }
   }
 
+  // Search messages
+  async searchMessages(userId, query, options = {}) {
+    try {
+      const { page = 1, limit = 20, chatId, messageType, startDate, endDate } = options;
+
+      // Build search query
+      let searchQuery = {
+        $text: { $search: query }
+      };
+
+      if (chatId) searchQuery.chatId = chatId;
+      if (messageType) searchQuery.messageType = messageType;
+      if (startDate || endDate) {
+        searchQuery.createdAt = {};
+        if (startDate) searchQuery.createdAt.$gte = startDate;
+        if (endDate) searchQuery.createdAt.$lte = endDate;
+      }
+
+      // Get user's accessible chats
+      const userChats = await Chat.find({
+        participants: userId,
+        isActive: true
+      }).select('_id');
+
+      const chatIds = userChats.map(chat => chat._id);
+      searchQuery.chatId = { $in: chatIds };
+
+      // Search messages
+      const messages = await Message.find(searchQuery)
+        .populate('chatId', 'type groupId')
+        .populate('senderId', 'username displayName profilePicture')
+        .populate('groupId', 'name')
+        .sort({ score: { $meta: 'textScore' } })
+        .skip((page - 1) * limit)
+        .limit(limit);
+
+      return messages;
+    } catch (error) {
+      logger.error('Search messages error:', error);
+      throw error;
+    }
+  }
+
+  // Delete message
   async deleteMessage(messageId, userId) {
     try {
       const message = await Message.findById(messageId);
@@ -418,20 +323,19 @@ class ChatService {
         throw new Error('Message not found');
       }
 
-      // Check permissions
+      // Check if user can delete message
       if (message.senderId.toString() !== userId.toString()) {
         // Check if user is admin in group chat
-        const chat = await Chat.findById(message.chatId);
-        if (!chat || chat.type !== 'group') {
-          throw new Error('Unauthorized to delete this message');
-        }
-
-        const participant = chat.participants.find(
-          p => p.userId.toString() === userId.toString() && p.status === 'active'
-        );
-
-        if (!participant || participant.role !== 'admin') {
-          throw new Error('Unauthorized to delete this message');
+        if (message.chatId.type === 'group') {
+          const chat = await Chat.findById(message.chatId).populate('groupId');
+          const group = chat.groupId;
+          const member = group.members.find(m => m.userId.toString() === userId);
+          
+          if (!member || member.role !== 'admin') {
+            throw new Error('Unauthorized to delete message');
+          }
+        } else {
+          throw new Error('Unauthorized to delete message');
         }
       }
 
@@ -441,356 +345,303 @@ class ChatService {
       message.deletedBy = userId;
       await message.save();
 
-      // Track analytics
-      await Analytics.create({
-        eventType: 'message_deleted',
-        eventName: 'Message Deleted',
-        eventCategory: 'communication',
-        userId,
-        platform: 'service',
-        metadata: {
-          messageId,
-          chatId: message.chatId,
-          originalSenderId: message.senderId
-        }
+      // Update chat message count
+      await Chat.findByIdAndUpdate(message.chatId, {
+        $inc: { messageCount: -1 }
       });
 
-      logger.info(`Message ${messageId} deleted by ${userId}`);
-      return message;
+      // Remove from cache
+      await this.removeCachedMessage(message.chatId, messageId);
 
+      logger.info(`Message ${messageId} deleted by user ${userId}`);
+
+      return message;
     } catch (error) {
       logger.error('Delete message error:', error);
       throw error;
     }
   }
 
-  // Typing Indicators
-  async setTypingStatus(chatId, userId, isTyping) {
+  // Update message
+  async updateMessage(messageId, userId, updateData) {
     try {
-      if (!this.userTyping.has(chatId)) {
-        this.userTyping.set(chatId, new Set());
+      const { content, attachments, metadata } = updateData;
+
+      const message = await Message.findById(messageId);
+      if (!message) {
+        throw new Error('Message not found');
       }
 
-      const typingUsers = this.userTyping.get(chatId);
-
-      if (isTyping) {
-        typingUsers.add(userId);
-        // Auto-remove typing status after 10 seconds
-        setTimeout(() => {
-          this.removeTypingStatus(chatId, userId);
-        }, 10000);
-      } else {
-        typingUsers.delete(userId);
+      // Check if user can edit message
+      if (message.senderId.toString() !== userId.toString()) {
+        throw new Error('Unauthorized to edit message');
       }
 
-      return Array.from(typingUsers);
+      // Check if message is too old to edit (e.g., 15 minutes)
+      const editTimeLimit = 15 * 60 * 1000; // 15 minutes
+      if (Date.now() - message.createdAt > editTimeLimit) {
+        throw new Error('Message too old to edit');
+      }
 
+      // Update message
+      message.content = content;
+      message.attachments = attachments || message.attachments;
+      message.metadata = { ...message.metadata, ...metadata };
+      message.isEdited = true;
+      message.editedAt = new Date();
+      await message.save();
+
+      // Update cache
+      await this.cacheMessage(message.chatId, message);
+
+      logger.info(`Message ${messageId} updated by user ${userId}`);
+
+      return message;
     } catch (error) {
-      logger.error('Set typing status error:', error);
+      logger.error('Update message error:', error);
       throw error;
     }
   }
 
-  async getTypingUsers(chatId) {
+  // Add participant to group chat
+  async addParticipantToGroup(chatId, userId, addedBy) {
     try {
-      const typingUsers = this.userTyping.get(chatId) || new Set();
-      return Array.from(typingUsers);
-    } catch (error) {
-      logger.error('Get typing users error:', error);
-      return [];
-    }
-  }
-
-  async removeTypingStatus(chatId, userId) {
-    try {
-      const typingUsers = this.userTyping.get(chatId);
-      if (typingUsers) {
-        typingUsers.delete(userId);
-      }
-    } catch (error) {
-      logger.error('Remove typing status error:', error);
-    }
-  }
-
-  // Unread Count Management
-  initializeUnreadCounts(chatId, userIds) {
-    userIds.forEach(userId => {
-      if (!this.unreadCounts.has(userId.toString())) {
-        this.unreadCounts.set(userId.toString(), new Map());
-      }
-      this.unreadCounts.get(userId.toString()).set(chatId.toString(), 0);
-    });
-  }
-
-  incrementUnreadCount(chatId, userId) {
-    try {
-      if (!this.unreadCounts.has(userId.toString())) {
-        this.unreadCounts.set(userId.toString(), new Map());
+      const chat = await Chat.findById(chatId).populate('groupId');
+      if (!chat || chat.type !== 'group') {
+        throw new Error('Chat not found or not a group chat');
       }
 
-      const userCounts = this.unreadCounts.get(userId.toString());
-      const currentCount = userCounts.get(chatId.toString()) || 0;
-      userCounts.set(chatId.toString(), currentCount + 1);
-    } catch (error) {
-      logger.error('Increment unread count error:', error);
-    }
-  }
-
-  resetUnreadCount(chatId, userId) {
-    try {
-      const userCounts = this.unreadCounts.get(userId.toString());
-      if (userCounts) {
-        userCounts.set(chatId.toString(), 0);
-      }
-    } catch (error) {
-      logger.error('Reset unread count error:', error);
-    }
-  }
-
-  removeUnreadCount(chatId, userId) {
-    try {
-      const userCounts = this.unreadCounts.get(userId.toString());
-      if (userCounts) {
-        userCounts.delete(chatId.toString());
-      }
-    } catch (error) {
-      logger.error('Remove unread count error:', error);
-    }
-  }
-
-  getUnreadCount(chatId, userId) {
-    try {
-      const userCounts = this.unreadCounts.get(userId.toString());
-      return userCounts ? (userCounts.get(chatId.toString()) || 0) : 0;
-    } catch (error) {
-      logger.error('Get unread count error:', error);
-      return 0;
-    }
-  }
-
-  getTotalUnreadCount(userId) {
-    try {
-      const userCounts = this.unreadCounts.get(userId.toString());
-      if (!userCounts) return 0;
-
-      let total = 0;
-      for (const count of userCounts.values()) {
-        total += count;
-      }
-      return total;
-    } catch (error) {
-      logger.error('Get total unread count error:', error);
-      return 0;
-    }
-  }
-
-  // Cache Management
-  addMessageToCache(chatId, message) {
-    try {
-      if (!this.messageCache.has(chatId)) {
-        this.messageCache.set(chatId, []);
+      // Check if user has permission
+      const group = chat.groupId;
+      const member = group.members.find(m => m.userId.toString() === addedBy);
+      
+      if (!member || (member.role !== 'admin' && member.role !== 'moderator')) {
+        throw new Error('Insufficient permissions');
       }
 
-      const cache = this.messageCache.get(chatId);
-      cache.push(message);
-
-      // Keep only last 100 messages in cache
-      if (cache.length > 100) {
-        cache.shift();
-      }
-    } catch (error) {
-      logger.error('Add message to cache error:', error);
-    }
-  }
-
-  getCachedMessages(chatId) {
-    try {
-      return this.messageCache.get(chatId) || [];
-    } catch (error) {
-      logger.error('Get cached messages error:', error);
-      return [];
-    }
-  }
-
-  clearCache(chatId) {
-    try {
-      this.messageCache.delete(chatId);
-      this.userTyping.delete(chatId);
-    } catch (error) {
-      logger.error('Clear cache error:', error);
-    }
-  }
-
-  // Chat Discovery
-  async getChatsForUser(userId, options = {}) {
-    try {
-      const { page = 1, limit = 20, type = null } = options;
-
-      let query = {
-        'participants.userId': userId,
-        'participants.status': 'active'
-      };
-
-      if (type) {
-        query.type = type;
+      // Check if user is already participant
+      if (chat.participants.includes(userId)) {
+        throw new Error('User is already a participant');
       }
 
-      const chats = await Chat.find(query)
-        .populate('participants.userId', 'username displayName profilePicture isOnline lastSeen')
-        .populate('lastMessage')
-        .sort({ lastMessageAt: -1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .lean();
+      // Add to chat participants
+      chat.participants.push(userId);
+      await chat.save();
 
-      // Add unread counts and typing status
-      const enrichedChats = chats.map(chat => {
-        const participant = chat.participants.find(
-          p => p.userId._id.toString() === userId.toString()
-        );
-
-        return {
-          ...chat,
-          unreadCount: this.getUnreadCount(chat._id, userId),
-          typingUsers: this.getTypingUsers(chat._id),
-          userRole: participant ? participant.role : null
-        };
+      // Add to group members
+      group.members.push({
+        userId,
+        role: 'member',
+        joinedAt: new Date(),
+        addedBy
       });
+      await group.save();
 
-      return enrichedChats;
+      // Update user chat mappings
+      this.addUserToChat(userId, chatId);
 
+      // Send system message
+      await this.sendSystemMessage(chatId, `User added to group by ${addedBy}`);
+
+      logger.info(`User ${userId} added to group chat ${chatId} by ${addedBy}`);
+
+      return { chat, group };
     } catch (error) {
-      logger.error('Get chats for user error:', error);
+      logger.error('Add participant to group error:', error);
       throw error;
     }
   }
 
-  async searchChats(userId, query, options = {}) {
+  // Remove participant from group chat
+  async removeParticipantFromGroup(chatId, userId, removedBy) {
     try {
-      const { page = 1, limit = 20, type = null } = options;
-
-      let searchQuery = {
-        'participants.userId': userId,
-        'participants.status': 'active'
-      };
-
-      if (type) {
-        searchQuery.type = type;
+      const chat = await Chat.findById(chatId).populate('groupId');
+      if (!chat || chat.type !== 'group') {
+        throw new Error('Chat not found or not a group chat');
       }
 
-      if (query) {
-        searchQuery.$or = [
-          { 'metadata.groupName': { $regex: query, $options: 'i' } },
-          { 'metadata.groupDescription': { $regex: query, $options: 'i' } }
-        ];
+      // Check if user has permission
+      const group = chat.groupId;
+      const member = group.members.find(m => m.userId.toString() === removedBy);
+      
+      if (!member || (member.role !== 'admin' && member.role !== 'moderator')) {
+        throw new Error('Insufficient permissions');
       }
 
-      const chats = await Chat.find(searchQuery)
-        .populate('participants.userId', 'username displayName profilePicture')
-        .populate('lastMessage')
-        .sort({ lastMessageAt: -1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .lean();
+      // Check if trying to remove admin
+      const targetMember = group.members.find(m => m.userId.toString() === userId);
+      if (targetMember && targetMember.role === 'admin') {
+        throw new Error('Cannot remove admin from group');
+      }
 
-      return chats;
+      // Remove from chat participants
+      chat.participants = chat.participants.filter(p => p.toString() !== userId);
+      await chat.save();
 
+      // Remove from group members
+      group.members = group.members.filter(m => m.userId.toString() !== userId);
+      await group.save();
+
+      // Update user chat mappings
+      this.removeUserFromChat(userId, chatId);
+
+      // Send system message
+      await this.sendSystemMessage(chatId, `User removed from group by ${removedBy}`);
+
+      logger.info(`User ${userId} removed from group chat ${chatId} by ${removedBy}`);
+
+      return { chat, group };
     } catch (error) {
-      logger.error('Search chats error:', error);
+      logger.error('Remove participant from group error:', error);
       throw error;
     }
   }
 
-  // Analytics and Statistics
-  async getChatStats(chatId, userId) {
+  // Send system message
+  async sendSystemMessage(chatId, content, metadata = {}) {
     try {
-      const chat = await Chat.findById(chatId);
-      if (!chat) {
-        throw new Error('Chat not found');
-      }
-
-      // Get message statistics
-      const messageStats = await Message.aggregate([
-        { $match: { chatId: chat._id } },
-        {
-          $group: {
-            _id: null,
-            totalMessages: { $sum: 1 },
-            messageTypes: { $addToSet: '$messageType' },
-            firstMessage: { $min: '$timestamp' },
-            lastMessage: { $max: '$timestamp' }
-          }
-        }
-      ]);
-
-      // Get participant statistics
-      const participantStats = {
-        totalParticipants: chat.participants.length,
-        activeParticipants: chat.participants.filter(p => p.status === 'active').length,
-        adminCount: chat.participants.filter(p => p.role === 'admin').length
-      };
-
-      // Get user's message count
-      const userMessageCount = await Message.countDocuments({
-        chatId: chat._id,
-        senderId: userId
-      });
-
-      return {
+      const message = new Message({
         chatId,
-        messageStats: messageStats[0] || {},
-        participantStats,
-        userMessageCount,
-        unreadCount: this.getUnreadCount(chatId, userId),
-        lastActivity: chat.lastMessageAt
-      };
+        senderId: null, // System message
+        content,
+        messageType: 'system',
+        metadata: {
+          ...metadata,
+          isSystem: true
+        }
+      });
 
+      await message.save();
+
+      // Update chat
+      await Chat.findByIdAndUpdate(chatId, {
+        lastMessage: message._id,
+        lastMessageAt: new Date(),
+        messageCount: { $inc: 1 }
+      });
+
+      return message;
     } catch (error) {
-      logger.error('Get chat stats error:', error);
+      logger.error('Send system message error:', error);
       throw error;
     }
   }
 
-  // Cleanup and Maintenance
+  // Cache message in Redis
+  async cacheMessage(chatId, message) {
+    try {
+      const key = `chat:${chatId}:messages`;
+      await redisManager.getClient().lpush(key, JSON.stringify(message));
+      
+      // Keep only last 100 messages in cache
+      await redisManager.getClient().ltrim(key, 0, 99);
+      
+      // Set expiry (24 hours)
+      await redisManager.getClient().expire(key, 86400);
+    } catch (error) {
+      logger.error('Cache message error:', error);
+    }
+  }
+
+  // Remove cached message
+  async removeCachedMessage(chatId, messageId) {
+    try {
+      const key = `chat:${chatId}:messages`;
+      const messages = await redisManager.getClient().lrange(key, 0, -1);
+      
+      const filteredMessages = messages.filter(msg => {
+        const message = JSON.parse(msg);
+        return message._id !== messageId;
+      });
+
+      await redisManager.getClient().del(key);
+      if (filteredMessages.length > 0) {
+        await redisManager.getClient().lpush(key, ...filteredMessages);
+        await redisManager.getClient().expire(key, 86400);
+      }
+    } catch (error) {
+      logger.error('Remove cached message error:', error);
+    }
+  }
+
+  // Update active chat
+  updateActiveChat(chatId, message) {
+    if (!this.activeChats.has(chatId)) {
+      this.activeChats.set(chatId, {
+        chatId,
+        lastMessage: message,
+        lastActivity: new Date(),
+        participantCount: 0
+      });
+    } else {
+      const chat = this.activeChats.get(chatId);
+      chat.lastMessage = message;
+      chat.lastActivity = new Date();
+      this.activeChats.set(chatId, chat);
+    }
+  }
+
+  // Add user to chat mapping
+  addUserToChat(userId, chatId) {
+    if (!this.userChats.has(userId)) {
+      this.userChats.set(userId, []);
+    }
+    
+    const userChats = this.userChats.get(userId);
+    if (!userChats.includes(chatId)) {
+      userChats.push(chatId);
+      this.userChats.set(userId, userChats);
+    }
+  }
+
+  // Remove user from chat mapping
+  removeUserFromChat(userId, chatId) {
+    if (this.userChats.has(userId)) {
+      const userChats = this.userChats.get(userId);
+      const filteredChats = userChats.filter(id => id.toString() !== chatId.toString());
+      this.userChats.set(userId, filteredChats);
+    }
+  }
+
+  // Get active chats
+  getActiveChats() {
+    return Array.from(this.activeChats.values());
+  }
+
+  // Get user chat count
+  getUserChatCount(userId) {
+    return this.userChats.get(userId)?.length || 0;
+  }
+
+  // Cleanup inactive chats
   async cleanupInactiveChats() {
     try {
-      const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+      const inactiveThreshold = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); // 30 days
 
       const inactiveChats = await Chat.find({
-        lastMessageAt: { $lt: thirtyDaysAgo },
-        type: 'direct'
+        lastMessageAt: { $lt: inactiveThreshold },
+        isActive: true
       });
 
       for (const chat of inactiveChats) {
-        // Archive inactive direct chats
-        chat.isArchived = true;
-        chat.archivedAt = new Date();
+        chat.isActive = false;
+        chat.deactivatedAt = new Date();
         await chat.save();
 
-        // Clear cache
-        this.clearCache(chat._id);
+        // Remove from active chats
+        this.activeChats.delete(chat._id.toString());
 
-        logger.info(`Archived inactive chat: ${chat._id}`);
+        // Remove from user mappings
+        chat.participants.forEach(userId => {
+          this.removeUserFromChat(userId, chat._id);
+        });
+
+        logger.info(`Chat ${chat._id} deactivated due to inactivity`);
       }
-
-      return inactiveChats.length;
-
     } catch (error) {
       logger.error('Cleanup inactive chats error:', error);
-      throw error;
     }
-  }
-
-  // Health Check
-  getHealthStatus() {
-    return {
-      messageCacheSize: this.messageCache.size,
-      userTypingSize: this.userTyping.size,
-      unreadCountsSize: this.unreadCounts.size,
-      totalCachedMessages: Array.from(this.messageCache.values()).reduce((total, messages) => total + messages.length, 0),
-      timestamp: new Date()
-    };
   }
 }
 
-module.exports = new ChatService();
+module.exports = ChatService;

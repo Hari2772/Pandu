@@ -1,546 +1,478 @@
-const { body, validationResult } = require('express-validator');
+const Joi = require('joi');
 const logger = require('../utils/logger');
 
-// Validation result handler
-const handleValidationErrors = (req, res, next) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    logger.warn(`Validation failed for ${req.method} ${req.path}:`, errors.array());
-    
-    return res.status(400).json({
-      success: false,
-      message: 'Validation failed',
-      errors: errors.array().map(error => ({
-        field: error.path,
-        message: error.msg,
-        value: error.value
-      }))
-    });
+// Common validation schemas
+const commonSchemas = {
+  // ObjectId validation
+  objectId: Joi.string().hex().length(24).required(),
+  
+  // Email validation
+  email: Joi.string().email().max(255).required(),
+  
+  // Username validation
+  username: Joi.string().alphanum().min(3).max(30).required(),
+  
+  // Password validation
+  password: Joi.string().min(8).max(128).required(),
+  
+  // Display name validation
+  displayName: Joi.string().min(2).max(100).required(),
+  
+  // Phone number validation
+  phoneNumber: Joi.string().pattern(/^\+?[1-9]\d{1,14}$/).optional(),
+  
+  // Date validation
+  date: Joi.date().iso().max('now').optional(),
+  
+  // Coordinates validation
+  coordinates: Joi.array().items(Joi.number()).length(2).required(),
+  
+  // Pagination validation
+  pagination: {
+    page: Joi.number().integer().min(1).default(1),
+    limit: Joi.number().integer().min(1).max(100).default(20)
   }
-  next();
 };
 
-// Registration validation
-const validateRegistration = [
-  body('email')
-    .isEmail()
-    .normalizeEmail()
-    .withMessage('Please provide a valid email address'),
-  
-  body('username')
-    .isLength({ min: 3, max: 30 })
-    .matches(/^[a-zA-Z0-9_]+$/)
-    .withMessage('Username must be 3-30 characters and contain only letters, numbers, and underscores'),
-  
-  body('displayName')
-    .isLength({ min: 2, max: 50 })
-    .trim()
-    .escape()
-    .withMessage('Display name must be 2-50 characters'),
-  
-  body('password')
-    .isLength({ min: 8, max: 128 })
-    .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]/)
-    .withMessage('Password must be at least 8 characters and contain uppercase, lowercase, number, and special character'),
-  
-  body('phoneNumber')
-    .optional()
-    .isMobilePhone()
-    .withMessage('Please provide a valid phone number'),
-  
-  body('dateOfBirth')
-    .optional()
-    .isISO8601()
-    .custom(value => {
-      const age = (new Date() - new Date(value)) / (1000 * 60 * 60 * 24 * 365.25);
-      if (age < 13) {
-        throw new Error('You must be at least 13 years old');
+// User validation schemas
+const userSchemas = {
+  // User registration
+  register: Joi.object({
+    email: commonSchemas.email,
+    username: commonSchemas.username,
+    displayName: commonSchemas.displayName,
+    password: commonSchemas.password,
+    phoneNumber: commonSchemas.phoneNumber,
+    dateOfBirth: commonSchemas.date,
+    interests: Joi.array().items(Joi.string()).max(20).optional(),
+    gender: Joi.string().valid('male', 'female', 'other', 'prefer_not_to_say').optional()
+  }),
+
+  // User login
+  login: Joi.object({
+    email: Joi.string().required(),
+    password: commonSchemas.password,
+    deviceId: Joi.string().optional(),
+    platform: Joi.string().valid('ios', 'android', 'web', 'desktop').optional(),
+    appVersion: Joi.string().optional()
+  }),
+
+  // User profile update
+  profileUpdate: Joi.object({
+    username: commonSchemas.username.optional(),
+    displayName: commonSchemas.displayName.optional(),
+    bio: Joi.string().max(500).optional(),
+    phoneNumber: commonSchemas.phoneNumber.optional(),
+    dateOfBirth: commonSchemas.date.optional(),
+    interests: Joi.array().items(Joi.string()).max(20).optional(),
+    gender: Joi.string().valid('male', 'female', 'other', 'prefer_not_to_say').optional(),
+    preferences: Joi.object().optional()
+  }),
+
+  // Password change
+  passwordChange: Joi.object({
+    currentPassword: commonSchemas.password,
+    newPassword: commonSchemas.password
+  }),
+
+  // Password reset
+  passwordReset: Joi.object({
+    token: Joi.string().required(),
+    newPassword: commonSchemas.password
+  }),
+
+  // Email verification
+  emailVerification: Joi.object({
+    token: Joi.string().required()
+  })
+};
+
+// Chat validation schemas
+const chatSchemas = {
+  // Chat data
+  chatData: Joi.object({
+    type: Joi.string().valid('direct', 'group').required(),
+    participants: Joi.array().items(commonSchemas.objectId).min(2).required(),
+    name: Joi.string().max(100).optional(),
+    description: Joi.string().max(500).optional(),
+    isPrivate: Joi.boolean().optional(),
+    avatar: Joi.string().uri().optional()
+  }),
+
+  // Message data
+  messageData: Joi.object({
+    content: Joi.string().max(5000).required(),
+    messageType: Joi.string().valid('text', 'image', 'video', 'audio', 'file', 'location', 'system').default('text'),
+    replyTo: commonSchemas.objectId.optional(),
+    attachments: Joi.array().items(Joi.object({
+      type: Joi.string().valid('image', 'video', 'audio', 'file').required(),
+      url: Joi.string().uri().required(),
+      filename: Joi.string().optional(),
+      size: Joi.number().positive().optional(),
+      mimeType: Joi.string().optional()
+    })).max(10).optional(),
+    metadata: Joi.object().optional()
+  }),
+
+  // Direct chat creation
+  directChat: Joi.object({
+    targetUserId: commonSchemas.objectId.required()
+  }),
+
+  // Group chat creation
+  groupChat: Joi.object({
+    name: Joi.string().min(2).max(100).required(),
+    description: Joi.string().max(500).optional(),
+    participants: Joi.array().items(commonSchemas.objectId).min(1).required(),
+    isPrivate: Joi.boolean().default(false),
+    avatar: Joi.string().uri().optional()
+  })
+};
+
+// Discovery validation schemas
+const discoverySchemas = {
+  // Location update
+  locationUpdate: Joi.object({
+    coordinates: commonSchemas.coordinates,
+    accuracy: Joi.number().positive().max(1000).optional(),
+    address: Joi.string().max(500).optional(),
+    placeName: Joi.string().max(200).optional()
+  }),
+
+  // Discovery request
+  discoveryRequest: Joi.object({
+    tier: Joi.number().integer().min(1).max(6).optional(),
+    radius: Joi.number().positive().max(50000).optional(),
+    limit: Joi.number().integer().min(1).max(100).default(50),
+    includeOffline: Joi.boolean().default(false),
+    excludeFriends: Joi.boolean().default(false),
+    excludeBlocked: Joi.boolean().default(false),
+    minAge: Joi.number().integer().min(13).max(120).optional(),
+    maxAge: Joi.number().integer().min(13).max(120).optional(),
+    interests: Joi.array().items(Joi.string()).max(20).optional(),
+    gender: Joi.string().valid('male', 'female', 'other').optional()
+  }),
+
+  // Area search
+  areaSearch: Joi.object({
+    coordinates: commonSchemas.coordinates,
+    radius: Joi.number().positive().max(50000).required(),
+    limit: Joi.number().integer().min(1).max(200).default(100),
+    includeOffline: Joi.boolean().default(false),
+    minTier: Joi.number().integer().min(1).max(6).default(1),
+    maxTier: Joi.number().integer().min(1).max(6).default(6)
+  })
+};
+
+// Call validation schemas
+const callSchemas = {
+  // Call initiation
+  callInitiate: Joi.object({
+    targetUserId: commonSchemas.objectId.required(),
+    callType: Joi.string().valid('audio', 'video').default('audio'),
+    chatId: commonSchemas.objectId.optional()
+  }),
+
+  // Call answer
+  callAnswer: Joi.object({
+    callId: commonSchemas.objectId.required(),
+    answer: Joi.string().valid('accept', 'reject').required()
+  }),
+
+  // Call end
+  callEnd: Joi.object({
+    callId: commonSchemas.objectId.required()
+  }),
+
+  // WebRTC signaling
+  webrtcSignal: Joi.object({
+    targetUserId: commonSchemas.objectId.required(),
+    signal: Joi.object().required(),
+    callId: commonSchemas.objectId.required()
+  })
+};
+
+// Group validation schemas
+const groupSchemas = {
+  // Group creation
+  groupCreate: Joi.object({
+    name: Joi.string().min(2).max(100).required(),
+    description: Joi.string().max(500).optional(),
+    isPrivate: Joi.boolean().default(false),
+    avatar: Joi.string().uri().optional(),
+    settings: Joi.object({
+      allowMemberInvites: Joi.boolean().default(true),
+      requireAdminApproval: Joi.boolean().default(false),
+      allowMemberEditing: Joi.boolean().default(false),
+      allowMemberDeletion: Joi.boolean().default(false)
+    }).optional()
+  }),
+
+  // Group update
+  groupUpdate: Joi.object({
+    name: Joi.string().min(2).max(100).optional(),
+    description: Joi.string().max(500).optional(),
+    isPrivate: Joi.boolean().optional(),
+    avatar: Joi.string().uri().optional(),
+    settings: Joi.object({
+      allowMemberInvites: Joi.boolean().optional(),
+      requireAdminApproval: Joi.boolean().optional(),
+      allowMemberEditing: Joi.boolean().optional(),
+      allowMemberDeletion: Joi.boolean().optional()
+    }).optional()
+  }),
+
+  // Member management
+  memberManagement: Joi.object({
+    userId: commonSchemas.objectId.required(),
+    role: Joi.string().valid('member', 'moderator', 'admin').default('member')
+  })
+};
+
+// Story validation schemas
+const storySchemas = {
+  // Story creation
+  storyCreate: Joi.object({
+    content: Joi.string().max(1000).optional(),
+    media: Joi.array().items(Joi.object({
+      type: Joi.string().valid('image', 'video').required(),
+      url: Joi.string().uri().required(),
+      thumbnail: Joi.string().uri().optional()
+    })).max(10).optional(),
+    isPrivate: Joi.boolean().default(false),
+    expiresIn: Joi.number().integer().min(1).max(24).default(24), // hours
+    location: Joi.object({
+      coordinates: commonSchemas.coordinates.optional(),
+      placeName: Joi.string().max(200).optional()
+    }).optional()
+  })
+};
+
+// Admin validation schemas
+const adminSchemas = {
+  // User management
+  userManagement: Joi.object({
+    userId: commonSchemas.objectId.required(),
+    action: Joi.string().valid('activate', 'deactivate', 'suspend', 'delete').required(),
+    reason: Joi.string().max(500).optional(),
+    duration: Joi.number().integer().positive().optional() // seconds
+  }),
+
+  // Feature flag
+  featureFlag: Joi.object({
+    name: Joi.string().min(3).max(100).required(),
+    description: Joi.string().max(500).optional(),
+    isActive: Joi.boolean().default(false),
+    userTiers: Joi.array().items(Joi.number().integer().min(1).max(6)).optional(),
+    userRoles: Joi.array().items(Joi.string().valid('user', 'moderator', 'admin', 'superadmin')).optional(),
+    rolloutPercentage: Joi.number().min(0).max(100).default(0),
+    startDate: Joi.date().iso().optional(),
+    endDate: Joi.date().iso().min(Joi.ref('startDate')).optional()
+  })
+};
+
+// Validation middleware factory
+const validateRequest = (schema, options = {}) => {
+  return (req, res, next) => {
+    try {
+      const { error, value } = schema.validate(req.body, {
+        abortEarly: false,
+        stripUnknown: true,
+        ...options
+      });
+
+      if (error) {
+        const errors = error.details.map(detail => ({
+          field: detail.path.join('.'),
+          message: detail.message,
+          type: detail.type
+        }));
+
+        logger.warn('Validation failed:', {
+          path: req.path,
+          method: req.method,
+          errors
+        });
+
+        return res.status(400).json({
+          success: false,
+          message: 'Validation failed',
+          errors
+        });
       }
-      if (age > 120) {
-        throw new Error('Please provide a valid date of birth');
+
+      // Replace validated data
+      req.body = value;
+      next();
+
+    } catch (error) {
+      logger.error('Validation middleware error:', error);
+      return res.status(500).json({
+        success: false,
+        message: 'Validation error'
+      });
+    }
+  };
+};
+
+// Query validation middleware
+const validateQuery = (schema, options = {}) => {
+  return (req, res, next) => {
+    try {
+      const { error, value } = schema.validate(req.query, {
+        abortEarly: false,
+        stripUnknown: true,
+        ...options
+      });
+
+      if (error) {
+        const errors = error.details.map(detail => ({
+          field: detail.path.join('.'),
+          message: detail.message,
+          type: detail.type
+        }));
+
+        return res.status(400).json({
+          success: false,
+          message: 'Query validation failed',
+          errors
+        });
       }
-      return true;
-    })
-    .withMessage('Invalid date of birth'),
-  
-  handleValidationErrors
-];
 
-// Login validation
-const validateLogin = [
-  body('email')
-    .notEmpty()
-    .withMessage('Email is required'),
-  
-  body('password')
-    .notEmpty()
-    .withMessage('Password is required'),
-  
-  body('deviceId')
-    .optional()
-    .isString()
-    .isLength({ max: 100 })
-    .withMessage('Device ID must be a string with maximum 100 characters'),
-  
-  body('platform')
-    .optional()
-    .isIn(['ios', 'android', 'web', 'desktop'])
-    .withMessage('Platform must be one of: ios, android, web, desktop'),
-  
-  body('appVersion')
-    .optional()
-    .isString()
-    .isLength({ max: 20 })
-    .withMessage('App version must be a string with maximum 20 characters'),
-  
-  handleValidationErrors
-];
+      // Replace validated query
+      req.query = value;
+      next();
 
-// Profile update validation
-const validateProfileUpdate = [
-  body('username')
-    .optional()
-    .isLength({ min: 3, max: 30 })
-    .matches(/^[a-zA-Z0-9_]+$/)
-    .withMessage('Username must be 3-30 characters and contain only letters, numbers, and underscores'),
-  
-  body('displayName')
-    .optional()
-    .isLength({ min: 2, max: 50 })
-    .trim()
-    .escape()
-    .withMessage('Display name must be 2-50 characters'),
-  
-  body('bio')
-    .optional()
-    .isLength({ max: 500 })
-    .trim()
-    .escape()
-    .withMessage('Bio must be maximum 500 characters'),
-  
-  body('phoneNumber')
-    .optional()
-    .isMobilePhone()
-    .withMessage('Please provide a valid phone number'),
-  
-  body('dateOfBirth')
-    .optional()
-    .isISO8601()
-    .custom(value => {
-      const age = (new Date() - new Date(value)) / (1000 * 60 * 60 * 24 * 365.25);
-      if (age < 13) {
-        throw new Error('You must be at least 13 years old');
+    } catch (error) {
+      logger.error('Query validation middleware error:', error);
+      return res.status(500).json({
+        success: false,
+        message: 'Query validation error'
+      });
+    }
+  };
+};
+
+// Params validation middleware
+const validateParams = (schema, options = {}) => {
+  return (req, res, next) => {
+    try {
+      const { error, value } = schema.validate(req.params, {
+        abortEarly: false,
+        stripUnknown: true,
+        ...options
+      });
+
+      if (error) {
+        const errors = error.details.map(detail => ({
+          field: detail.path.join('.'),
+          message: detail.message,
+          type: detail.type
+        }));
+
+        return res.status(400).json({
+          success: false,
+          message: 'Parameter validation failed',
+          errors
+        });
       }
-      if (age > 120) {
-        throw new Error('Please provide a valid date of birth');
-      }
-      return true;
-    })
-    .withMessage('Invalid date of birth'),
-  
-  body('preferences')
-    .optional()
-    .isObject()
-    .withMessage('Preferences must be an object'),
-  
-  body('preferences.language')
-    .optional()
-    .isIn(['en', 'es', 'fr', 'de', 'it', 'pt', 'ru', 'zh', 'ja', 'ko'])
-    .withMessage('Language must be a supported language code'),
-  
-  body('preferences.timezone')
-    .optional()
-    .isString()
-    .withMessage('Timezone must be a string'),
-  
-  body('preferences.notifications')
-    .optional()
-    .isObject()
-    .withMessage('Notification preferences must be an object'),
-  
-  body('preferences.privacy')
-    .optional()
-    .isObject()
-    .withMessage('Privacy preferences must be an object'),
-  
-  handleValidationErrors
-];
 
-// Location update validation
-const validateLocationUpdate = [
-  body('coordinates')
-    .isArray({ min: 2, max: 2 })
-    .withMessage('Coordinates must be an array with exactly 2 elements'),
-  
-  body('coordinates.*')
-    .isFloat({ min: -180, max: 180 })
-    .withMessage('Coordinates must be valid longitude (-180 to 180) and latitude (-90 to 90)'),
-  
-  body('accuracy')
-    .optional()
-    .isFloat({ min: 0, max: 10000 })
-    .withMessage('Accuracy must be a positive number up to 10,000 meters'),
-  
-  body('address')
-    .optional()
-    .isString()
-    .isLength({ max: 200 })
-    .trim()
-    .escape()
-    .withMessage('Address must be a string with maximum 200 characters'),
-  
-  body('placeName')
-    .optional()
-    .isString()
-    .isLength({ max: 100 })
-    .trim()
-    .escape()
-    .withMessage('Place name must be a string with maximum 100 characters'),
-  
-  handleValidationErrors
-];
+      // Replace validated params
+      req.params = value;
+      next();
 
-// Message validation
-const validateMessage = [
-  body('content')
-    .notEmpty()
-    .isLength({ max: 5000 })
-    .trim()
-    .escape()
-    .withMessage('Message content is required and must be maximum 5,000 characters'),
-  
-  body('chatId')
-    .isMongoId()
-    .withMessage('Valid chat ID is required'),
-  
-  body('messageType')
-    .optional()
-    .isIn(['text', 'media', 'location', 'voice', 'sticker', 'file'])
-    .withMessage('Message type must be one of: text, media, location, voice, sticker, file'),
-  
-  body('replyTo')
-    .optional()
-    .isMongoId()
-    .withMessage('Reply message ID must be a valid MongoDB ID'),
-  
-  body('mediaUrl')
-    .optional()
-    .isURL()
-    .withMessage('Media URL must be a valid URL'),
-  
-  body('location')
-    .optional()
-    .isObject()
-    .withMessage('Location must be an object'),
-  
-  body('location.coordinates')
-    .optional()
-    .isArray({ min: 2, max: 2 })
-    .withMessage('Location coordinates must be an array with exactly 2 elements'),
-  
-  handleValidationErrors
-];
+    } catch (error) {
+      logger.error('Params validation middleware error:', error);
+      return res.status(500).json({
+        success: false,
+        message: 'Parameter validation error'
+      });
+    }
+  };
+};
 
-// Story validation
-const validateStory = [
-  body('content')
-    .notEmpty()
-    .isLength({ max: 1000 })
-    .trim()
-    .escape()
-    .withMessage('Story content is required and must be maximum 1,000 characters'),
-  
-  body('mediaUrl')
-    .optional()
-    .isURL()
-    .withMessage('Media URL must be a valid URL'),
-  
-  body('expiresIn')
-    .optional()
-    .isInt({ min: 1, max: 72 })
-    .withMessage('Story expiration must be between 1 and 72 hours'),
-  
-  body('isPublic')
-    .optional()
-    .isBoolean()
-    .withMessage('Public flag must be a boolean'),
-  
-  body('location')
-    .optional()
-    .isObject()
-    .withMessage('Location must be an object'),
-  
-  handleValidationErrors
-];
+// Specific validation middlewares
+const validateUserData = (req, res, next) => {
+  return validateRequest(userSchemas.profileUpdate)(req, res, next);
+};
 
-// Group validation
-const validateGroup = [
-  body('name')
-    .notEmpty()
-    .isLength({ min: 2, max: 100 })
-    .trim()
-    .escape()
-    .withMessage('Group name is required and must be 2-100 characters'),
-  
-  body('description')
-    .optional()
-    .isLength({ max: 500 })
-    .trim()
-    .escape()
-    .withMessage('Group description must be maximum 500 characters'),
-  
-  body('isPrivate')
-    .optional()
-    .isBoolean()
-    .withMessage('Private flag must be a boolean'),
-  
-  body('maxMembers')
-    .optional()
-    .isInt({ min: 2, max: 1000 })
-    .withMessage('Maximum members must be between 2 and 1,000'),
-  
-  body('location')
-    .optional()
-    .isObject()
-    .withMessage('Location must be an object'),
-  
-  handleValidationErrors
-];
+const validateChatData = (req, res, next) => {
+  return validateRequest(chatSchemas.chatData)(req, res, next);
+};
 
-// Call validation
-const validateCall = [
-  body('targetUserId')
-    .isMongoId()
-    .withMessage('Valid target user ID is required'),
-  
-  body('callType')
-    .optional()
-    .isIn(['audio', 'video'])
-    .withMessage('Call type must be audio or video'),
-  
-  body('isVideo')
-    .optional()
-    .isBoolean()
-    .withMessage('Video flag must be a boolean'),
-  
-  body('isScreenShare')
-    .optional()
-    .isBoolean()
-    .withMessage('Screen share flag must be a boolean'),
-  
-  handleValidationErrors
-];
+const validateMessageData = (req, res, next) => {
+  return validateRequest(chatSchemas.messageData)(req, res, next);
+};
 
-// Search validation
-const validateSearch = [
-  body('query')
-    .notEmpty()
-    .isLength({ min: 2, max: 100 })
-    .trim()
-    .escape()
-    .withMessage('Search query is required and must be 2-100 characters'),
-  
-  body('type')
-    .optional()
-    .isIn(['users', 'messages', 'groups', 'stories'])
-    .withMessage('Search type must be one of: users, messages, groups, stories'),
-  
-  body('limit')
-    .optional()
-    .isInt({ min: 1, max: 100 })
-    .withMessage('Search limit must be between 1 and 100'),
-  
-  body('offset')
-    .optional()
-    .isInt({ min: 0 })
-    .withMessage('Search offset must be a non-negative integer'),
-  
-  handleValidationErrors
-];
+const validateLocationData = (req, res, next) => {
+  return validateRequest(discoverySchemas.locationUpdate)(req, res, next);
+};
 
-// Pagination validation
-const validatePagination = [
-  body('page')
-    .optional()
-    .isInt({ min: 1 })
-    .withMessage('Page must be a positive integer'),
-  
-  body('limit')
-    .optional()
-    .isInt({ min: 1, max: 100 })
-    .withMessage('Limit must be between 1 and 100'),
-  
-  body('sortBy')
-    .optional()
-    .isString()
-    .isLength({ max: 50 })
-    .withMessage('Sort field must be a string with maximum 50 characters'),
-  
-  body('sortOrder')
-    .optional()
-    .isIn(['asc', 'desc'])
-    .withMessage('Sort order must be asc or desc'),
-  
-  handleValidationErrors
-];
+const validateCallData = (req, res, next) => {
+  return validateRequest(callSchemas.callInitiate)(req, res, next);
+};
 
-// File upload validation
-const validateFileUpload = [
-  body('file')
-    .notEmpty()
-    .withMessage('File is required'),
-  
-  body('file.mimetype')
-    .optional()
-    .isIn(['image/jpeg', 'image/png', 'image/gif', 'video/mp4', 'audio/mpeg'])
-    .withMessage('File type not supported'),
-  
-  body('file.size')
-    .optional()
-    .isInt({ max: 10 * 1024 * 1024 }) // 10MB
-    .withMessage('File size must be less than 10MB'),
-  
-  handleValidationErrors
-];
+const validateGroupData = (req, res, next) => {
+  return validateRequest(groupSchemas.groupCreate)(req, res, next);
+};
 
-// Admin action validation
-const validateAdminAction = [
-  body('action')
-    .notEmpty()
-    .isIn(['ban', 'unban', 'warn', 'delete', 'moderate'])
-    .withMessage('Valid admin action is required'),
-  
-  body('targetUserId')
-    .isMongoId()
-    .withMessage('Valid target user ID is required'),
-  
-  body('reason')
-    .optional()
-    .isLength({ max: 500 })
-    .trim()
-    .escape()
-    .withMessage('Reason must be maximum 500 characters'),
-  
-  body('duration')
-    .optional()
-    .isInt({ min: 1, max: 365 })
-    .withMessage('Duration must be between 1 and 365 days'),
-  
-  handleValidationErrors
-];
-
-// Feature flag validation
-const validateFeatureFlag = [
-  body('name')
-    .notEmpty()
-    .isLength({ min: 3, max: 50 })
-    .matches(/^[a-zA-Z0-9_]+$/)
-    .withMessage('Feature name must be 3-50 characters and contain only letters, numbers, and underscores'),
-  
-  body('description')
-    .optional()
-    .isLength({ max: 200 })
-    .trim()
-    .escape()
-    .withMessage('Description must be maximum 200 characters'),
-  
-  body('isEnabled')
-    .optional()
-    .isBoolean()
-    .withMessage('Enabled flag must be a boolean'),
-  
-  body('rolloutPercentage')
-    .optional()
-    .isInt({ min: 0, max: 100 })
-    .withMessage('Rollout percentage must be between 0 and 100'),
-  
-  body('dependencies')
-    .optional()
-    .isArray()
-    .withMessage('Dependencies must be an array'),
-  
-  body('dependencies.*')
-    .optional()
-    .isString()
-    .withMessage('Each dependency must be a string'),
-  
-  handleValidationErrors
-];
+const validateStoryData = (req, res, next) => {
+  return validateRequest(storySchemas.storyCreate)(req, res, next);
+};
 
 // Sanitization middleware
 const sanitizeInput = (req, res, next) => {
   try {
-    // Sanitize string fields
+    // Sanitize body
     if (req.body) {
       Object.keys(req.body).forEach(key => {
         if (typeof req.body[key] === 'string') {
-          req.body[key] = req.body[key].trim();
+          // Remove HTML tags and trim whitespace
+          req.body[key] = req.body[key].replace(/<[^>]*>/g, '').trim();
         }
       });
     }
-    
-    // Sanitize query parameters
+
+    // Sanitize query
     if (req.query) {
       Object.keys(req.query).forEach(key => {
         if (typeof req.query[key] === 'string') {
-          req.query[key] = req.query[key].trim();
+          req.query[key] = req.query[key].replace(/<[^>]*>/g, '').trim();
         }
       });
     }
-    
+
     next();
   } catch (error) {
-    logger.error('Input sanitization error:', error);
+    logger.error('Sanitization middleware error:', error);
     next();
   }
 };
 
-// Custom validation functions
-const customValidators = {
-  // Check if username is available
-  isUsernameAvailable: async (username) => {
-    const User = require('../models/User');
-    const user = await User.findOne({ username });
-    return !user;
-  },
-  
-  // Check if email is available
-  isEmailAvailable: async (email) => {
-    const User = require('../models/User');
-    const user = await User.findOne({ email });
-    return !user;
-  },
-  
-  // Validate MongoDB ObjectId
-  isValidObjectId: (value) => {
-    return /^[0-9a-fA-F]{24}$/.test(value);
-  },
-  
-  // Validate coordinates
-  isValidCoordinates: (coordinates) => {
-    if (!Array.isArray(coordinates) || coordinates.length !== 2) {
-      return false;
-    }
-    const [lng, lat] = coordinates;
-    return lng >= -180 && lng <= 180 && lat >= -90 && lat <= 90;
-  }
-};
-
+// Export all validation functions and schemas
 module.exports = {
-  handleValidationErrors,
-  validateRegistration,
-  validateLogin,
-  validateProfileUpdate,
-  validateLocationUpdate,
-  validateMessage,
-  validateStory,
-  validateGroup,
-  validateCall,
-  validateSearch,
-  validatePagination,
-  validateFileUpload,
-  validateAdminAction,
-  validateFeatureFlag,
+  // Middleware functions
+  validateRequest,
+  validateQuery,
+  validateParams,
+  validateUserData,
+  validateChatData,
+  validateMessageData,
+  validateLocationData,
+  validateCallData,
+  validateGroupData,
+  validateStoryData,
   sanitizeInput,
-  customValidators
+
+  // Schemas
+  schemas: {
+    common: commonSchemas,
+    user: userSchemas,
+    chat: chatSchemas,
+    discovery: discoverySchemas,
+    call: callSchemas,
+    group: groupSchemas,
+    story: storySchemas,
+    admin: adminSchemas
+  }
 };

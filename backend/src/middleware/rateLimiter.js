@@ -2,217 +2,136 @@ const redisManager = require('../config/redis');
 const logger = require('../utils/logger');
 
 // Rate limiting middleware factory
-const rateLimiter = (type, maxRequests, windowMs, options = {}) => {
+const rateLimiter = (key, maxRequests, windowSeconds) => {
   return async (req, res, next) => {
     try {
-      const {
-        keyGenerator = null,
-        skipSuccessfulRequests = false,
-        skipFailedRequests = false,
-        errorMessage = 'Rate limit exceeded',
-        headers = true
-      } = options;
+      // Get client identifier (IP address or user ID)
+      const identifier = req.user ? req.user.id : req.ip || req.connection.remoteAddress;
+      const rateKey = `rate_limit:${key}:${identifier}`;
 
-      // Generate rate limit key
-      let key;
-      if (keyGenerator) {
-        key = keyGenerator(req);
-      } else {
-        // Default key generation based on user ID or IP
-        const identifier = req.user ? req.user.id : req.ip;
-        key = `rate_limit:${type}:${identifier}`;
+      // Get current request count
+      const currentCount = await redisManager.getClient().incr(rateKey);
+
+      // Set expiry on first request
+      if (currentCount === 1) {
+        await redisManager.getClient().expire(rateKey, windowSeconds);
       }
 
-      if (!key) {
-        return next();
-      }
-
-      // Get current usage from Redis
-      const currentUsage = await redisManager.getClient().get(key);
-      const requests = currentUsage ? parseInt(currentUsage) : 0;
-
-      // Check if limit exceeded
-      if (requests >= maxRequests) {
+      // Check if rate limit exceeded
+      if (currentCount > maxRequests) {
         // Get time until reset
-        const ttl = await redisManager.getClient().ttl(key);
+        const ttl = await redisManager.getClient().ttl(rateKey);
         
-        if (headers) {
-          res.set({
-            'X-RateLimit-Limit': maxRequests,
-            'X-RateLimit-Remaining': 0,
-            'X-RateLimit-Reset': Math.ceil(Date.now() / 1000) + ttl,
-            'Retry-After': ttl
-          });
-        }
+        // Set rate limit headers
+        res.set({
+          'X-RateLimit-Limit': maxRequests,
+          'X-RateLimit-Remaining': 0,
+          'X-RateLimit-Reset': Math.floor(Date.now() / 1000) + ttl
+        });
 
         return res.status(429).json({
           success: false,
-          message: errorMessage,
-          limit: maxRequests,
-          window: windowMs,
-          resetTime: Math.ceil(Date.now() / 1000) + ttl,
-          retryAfter: ttl
+          message: 'Rate limit exceeded',
+          error: {
+            code: 'RATE_LIMIT_EXCEEDED',
+            limit: maxRequests,
+            window: windowSeconds,
+            resetIn: ttl
+          }
         });
       }
 
-      // Increment counter
-      const multi = redisManager.getClient().multi();
-      multi.incr(key);
-      multi.expire(key, Math.ceil(windowMs / 1000));
-      
-      const results = await multi.exec();
-      const newCount = results[0][1];
-
-      // Set response headers
-      if (headers) {
-        res.set({
-          'X-RateLimit-Limit': maxRequests,
-          'X-RateLimit-Remaining': Math.max(0, maxRequests - newCount),
-          'X-RateLimit-Reset': Math.ceil(Date.now() / 1000) + Math.ceil(windowMs / 1000)
-        });
-      }
-
-      // Track rate limit usage for analytics
-      if (req.user) {
-        try {
-          const Analytics = require('../models/Analytics');
-          await Analytics.create({
-            eventType: 'rate_limit_check',
-            eventName: 'Rate Limit Check',
-            eventCategory: 'system',
-            userId: req.user.id,
-            sessionId: req.sessionID || 'unknown',
-            platform: 'web',
-            metadata: {
-              type,
-              currentUsage: newCount,
-              maxRequests,
-              windowMs,
-              endpoint: req.path,
-              method: req.method
-            }
-          });
-        } catch (error) {
-          logger.debug('Failed to track rate limit analytics:', error.message);
-        }
-      }
+      // Set rate limit headers
+      const ttl = await redisManager.getClient().ttl(rateKey);
+      res.set({
+        'X-RateLimit-Limit': maxRequests,
+        'X-RateLimit-Remaining': Math.max(0, maxRequests - currentCount),
+        'X-RateLimit-Reset': Math.floor(Date.now() / 1000) + ttl
+      });
 
       next();
 
     } catch (error) {
       logger.error('Rate limiting error:', error);
-      // Continue without rate limiting on error
+      // Continue without rate limiting if Redis fails
       next();
     }
   };
 };
 
-// User-specific rate limiter
-const userRateLimiter = (type, maxRequests, windowMs, options = {}) => {
-  return async (req, res, next) => {
-    if (!req.user) {
-      return res.status(401).json({
-        success: false,
-        message: 'Authentication required for rate limiting'
-      });
-    }
-
-    const userOptions = {
-      ...options,
-      keyGenerator: (req) => `rate_limit:${type}:user:${req.user.id}`
-    };
-
-    return rateLimiter(type, maxRequests, windowMs, userOptions)(req, res, next);
-  };
-};
-
-// IP-based rate limiter
-const ipRateLimiter = (type, maxRequests, windowMs, options = {}) => {
-  return async (req, res, next) => {
-    const ipOptions = {
-      ...options,
-      keyGenerator: (req) => `rate_limit:${type}:ip:${req.ip}`
-    };
-
-    return rateLimiter(type, maxRequests, windowMs, ipOptions)(req, res, next);
-  };
-};
-
-// Tier-based rate limiter
-const tierRateLimiter = (type, baseRequests, windowMs, options = {}) => {
-  return async (req, res, next) => {
-    if (!req.user) {
-      return res.status(401).json({
-        success: false,
-        message: 'Authentication required for tier-based rate limiting'
-      });
-    }
-
-    // Calculate requests based on user tier
-    const tierMultiplier = Math.max(1, req.user.tier - 1);
-    const maxRequests = baseRequests + (tierMultiplier * 5); // +5 per tier level
-
-    const tierOptions = {
-      ...options,
-      keyGenerator: (req) => `rate_limit:${type}:tier:${req.user.tier}:${req.user.id}`,
-      errorMessage: `Rate limit exceeded for tier ${req.user.tier}`
-    };
-
-    return rateLimiter(type, maxRequests, windowMs, tierOptions)(req, res, next);
-  };
-};
-
-// Burst rate limiter (allows burst of requests with cooldown)
-const burstRateLimiter = (type, burstLimit, cooldownMs, options = {}) => {
+// Dynamic rate limiting based on user tier
+const dynamicRateLimiter = (baseKey, baseRequests, windowSeconds) => {
   return async (req, res, next) => {
     try {
-      const {
-        keyGenerator = null,
-        errorMessage = 'Burst rate limit exceeded'
-      } = options;
-
-      // Generate key
-      let key;
-      if (keyGenerator) {
-        key = keyGenerator(req);
-      } else {
-        const identifier = req.user ? req.user.id : req.ip;
-        key = `burst_limit:${type}:${identifier}`;
+      if (!req.user) {
+        // Apply base rate limit for unauthenticated users
+        return rateLimiter(baseKey, Math.floor(baseRequests * 0.1), windowSeconds)(req, res, next);
       }
 
-      if (!key) {
-        return next();
+      // Calculate rate limit based on user tier
+      const tierMultiplier = Math.min(3, 1 + (req.user.tier - 1) * 0.2); // Max 3x for tier 6
+      const adjustedRequests = Math.floor(baseRequests * tierMultiplier);
+
+      // Apply adjusted rate limit
+      return rateLimiter(baseKey, adjustedRequests, windowSeconds)(req, res, next);
+
+    } catch (error) {
+      logger.error('Dynamic rate limiting error:', error);
+      next();
+    }
+  };
+};
+
+// Burst rate limiting (allows short bursts above normal limit)
+const burstRateLimiter = (key, normalRequests, burstRequests, windowSeconds) => {
+  return async (req, res, next) => {
+    try {
+      const identifier = req.user ? req.user.id : req.ip || req.connection.remoteAddress;
+      const normalKey = `rate_limit:${key}:${identifier}:normal`;
+      const burstKey = `rate_limit:${key}:${identifier}:burst`;
+
+      // Check normal rate limit
+      const normalCount = await redisManager.getClient().incr(normalKey);
+      if (normalCount === 1) {
+        await redisManager.getClient().expire(normalKey, windowSeconds);
       }
 
-      // Get current burst count
-      const currentBurst = await redisManager.getClient().get(key);
-      const burstCount = currentBurst ? parseInt(currentBurst) : 0;
-
-      if (burstCount >= burstLimit) {
-        // Check if cooldown period has passed
-        const ttl = await redisManager.getClient().ttl(key);
-        
-        if (ttl > 0) {
-          return res.status(429).json({
-            success: false,
-            message: errorMessage,
-            burstLimit,
-            cooldownMs,
-            resetTime: Math.ceil(Date.now() / 1000) + ttl,
-            retryAfter: ttl
-          });
-        } else {
-          // Reset burst counter
-          await redisManager.getClient().del(key);
-        }
+      // Check burst rate limit (shorter window)
+      const burstWindow = Math.min(10, Math.floor(windowSeconds * 0.1)); // 10% of normal window
+      const burstCount = await redisManager.getClient().incr(burstKey);
+      if (burstCount === 1) {
+        await redisManager.getClient().expire(burstKey, burstWindow);
       }
 
-      // Increment burst counter
-      const multi = redisManager.getClient().multi();
-      multi.incr(key);
-      multi.expire(key, Math.ceil(cooldownMs / 1000));
-      
-      await multi.exec();
+      // Apply stricter limit for burst
+      if (burstCount > burstRequests) {
+        const ttl = await redisManager.getClient().ttl(burstKey);
+        return res.status(429).json({
+          success: false,
+          message: 'Burst rate limit exceeded',
+          error: {
+            code: 'BURST_RATE_LIMIT_EXCEEDED',
+            limit: burstRequests,
+            window: burstWindow,
+            resetIn: ttl
+          }
+        });
+      }
+
+      // Apply normal rate limit
+      if (normalCount > normalRequests) {
+        const ttl = await redisManager.getClient().ttl(normalKey);
+        return res.status(429).json({
+          success: false,
+          message: 'Rate limit exceeded',
+          error: {
+            code: 'RATE_LIMIT_EXCEEDED',
+            limit: normalRequests,
+            window: windowSeconds,
+            resetIn: ttl
+          }
+        });
+      }
 
       next();
 
@@ -223,162 +142,195 @@ const burstRateLimiter = (type, burstLimit, cooldownMs, options = {}) => {
   };
 };
 
-// Adaptive rate limiter (adjusts limits based on user behavior)
-const adaptiveRateLimiter = (type, baseRequests, windowMs, options = {}) => {
+// Sliding window rate limiting
+const slidingWindowRateLimiter = (key, maxRequests, windowSeconds) => {
   return async (req, res, next) => {
     try {
-      if (!req.user) {
-        return res.status(401).json({
+      const identifier = req.user ? req.user.id : req.ip || req.connection.remoteAddress;
+      const now = Date.now();
+      const windowStart = now - (windowSeconds * 1000);
+
+      // Use sorted set to track requests with timestamps
+      const rateKey = `rate_limit:${key}:${identifier}`;
+      
+      // Add current request
+      await redisManager.getClient().zadd(rateKey, now, `${now}-${Math.random()}`);
+
+      // Remove expired requests
+      await redisManager.getClient().zremrangebyscore(rateKey, 0, windowStart);
+
+      // Count requests in current window
+      const requestCount = await redisManager.getClient().zcard(rateKey);
+
+      // Set expiry
+      await redisManager.getClient().expire(rateKey, windowSeconds);
+
+      if (requestCount > maxRequests) {
+        // Get oldest request timestamp
+        const oldestRequest = await redisManager.getClient().zrange(rateKey, 0, 0, 'WITHSCORES');
+        const resetTime = Math.floor((parseInt(oldestRequest[1]) + (windowSeconds * 1000)) / 1000);
+
+        return res.status(429).json({
           success: false,
-          message: 'Authentication required for adaptive rate limiting'
+          message: 'Rate limit exceeded',
+          error: {
+            code: 'RATE_LIMIT_EXCEEDED',
+            limit: maxRequests,
+            window: windowSeconds,
+            resetIn: resetTime - Math.floor(now / 1000)
+          }
         });
       }
 
-      const {
-        minRequests = 1,
-        maxRequests = baseRequests * 5,
-        behaviorWindow = 24 * 60 * 60 * 1000, // 24 hours
-        goodBehaviorThreshold = 100,
-        badBehaviorThreshold = 10
-      } = options;
+      // Set rate limit headers
+      res.set({
+        'X-RateLimit-Limit': maxRequests,
+        'X-RateLimit-Remaining': Math.max(0, maxRequests - requestCount),
+        'X-RateLimit-Reset': Math.floor((now + (windowSeconds * 1000)) / 1000)
+      });
 
-      // Get user behavior score
-      const behaviorKey = `behavior_score:${req.user.id}`;
-      const behaviorScore = await redisManager.getClient().get(behaviorKey);
-      const score = behaviorScore ? parseInt(behaviorScore) : 50; // Default neutral score
-
-      // Calculate adaptive limit
-      let adaptiveLimit = baseRequests;
-      if (score > goodBehaviorThreshold) {
-        adaptiveLimit = Math.min(maxRequests, baseRequests * 2);
-      } else if (score < badBehaviorThreshold) {
-        adaptiveLimit = Math.max(minRequests, Math.floor(baseRequests * 0.5));
-      }
-
-      const adaptiveOptions = {
-        ...options,
-        keyGenerator: (req) => `rate_limit:${type}:adaptive:${req.user.id}`,
-        errorMessage: `Rate limit exceeded (adaptive limit: ${adaptiveLimit})`
-      };
-
-      return rateLimiter(type, adaptiveLimit, windowMs, adaptiveOptions)(req, res, next);
+      next();
 
     } catch (error) {
-      logger.error('Adaptive rate limiting error:', error);
+      logger.error('Sliding window rate limiting error:', error);
       next();
     }
   };
 };
 
-// Global rate limiter for entire application
-const globalRateLimiter = (maxRequests, windowMs, options = {}) => {
+// User-specific rate limiting
+const userRateLimiter = (key, maxRequests, windowSeconds) => {
   return async (req, res, next) => {
-    const globalOptions = {
-      ...options,
-      keyGenerator: () => 'rate_limit:global:all',
-      errorMessage: 'Global rate limit exceeded'
-    };
+    try {
+      if (!req.user) {
+        return res.status(401).json({
+          success: false,
+          message: 'Authentication required for rate limiting'
+        });
+      }
 
-    return rateLimiter('global', maxRequests, windowMs, globalOptions)(req, res, next);
+      const rateKey = `rate_limit:${key}:user:${req.user.id}`;
+      const currentCount = await redisManager.getClient().incr(rateKey);
+
+      if (currentCount === 1) {
+        await redisManager.getClient().expire(rateKey, windowSeconds);
+      }
+
+      if (currentCount > maxRequests) {
+        const ttl = await redisManager.getClient().ttl(rateKey);
+        
+        return res.status(429).json({
+          success: false,
+          message: 'User rate limit exceeded',
+          error: {
+            code: 'USER_RATE_LIMIT_EXCEEDED',
+            limit: maxRequests,
+            window: windowSeconds,
+            resetIn: ttl
+          }
+        });
+      }
+
+      next();
+
+    } catch (error) {
+      logger.error('User rate limiting error:', error);
+      next();
+    }
   };
 };
 
-// Rate limit status middleware
-const getRateLimitStatus = async (req, res) => {
-  try {
-    if (!req.user) {
-      return res.status(401).json({
-        success: false,
-        message: 'Authentication required'
-      });
-    }
+// IP-based rate limiting with whitelist
+const ipRateLimiter = (key, maxRequests, windowSeconds, whitelist = []) => {
+  return async (req, res, next) => {
+    try {
+      const ip = req.ip || req.connection.remoteAddress;
 
-    const userId = req.user.id;
-    const rateLimits = [];
+      // Check whitelist
+      if (whitelist.includes(ip)) {
+        return next();
+      }
 
-    // Get all rate limit keys for user
-    const keys = await redisManager.getClient().keys(`rate_limit:*:${userId}`);
-    
-    for (const key of keys) {
-      const [_, type, identifier] = key.split(':');
-      const currentUsage = await redisManager.getClient().get(key);
-      const ttl = await redisManager.getClient().ttl(key);
-      
-      if (currentUsage && ttl > 0) {
-        rateLimits.push({
-          type,
-          identifier,
-          currentUsage: parseInt(currentUsage),
-          ttl,
-          resetTime: Math.ceil(Date.now() / 1000) + ttl
+      const rateKey = `rate_limit:${key}:ip:${ip}`;
+      const currentCount = await redisManager.getClient().incr(rateKey);
+
+      if (currentCount === 1) {
+        await redisManager.getClient().expire(rateKey, windowSeconds);
+      }
+
+      if (currentCount > maxRequests) {
+        const ttl = await redisManager.getClient().ttl(rateKey);
+        
+        return res.status(429).json({
+          success: false,
+          message: 'IP rate limit exceeded',
+          error: {
+            code: 'IP_RATE_LIMIT_EXCEEDED',
+            limit: maxRequests,
+            window: windowSeconds,
+            resetIn: ttl
+          }
         });
       }
+
+      next();
+
+    } catch (error) {
+      logger.error('IP rate limiting error:', error);
+      next();
     }
-
-    res.json({
-      success: true,
-      data: {
-        userId,
-        rateLimits,
-        timestamp: new Date().toISOString()
-      }
-    });
-
-  } catch (error) {
-    logger.error('Get rate limit status error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to get rate limit status'
-    });
-  }
+  };
 };
 
-// Reset rate limit for user (admin only)
-const resetUserRateLimit = async (req, res) => {
+// Rate limit info middleware
+const rateLimitInfo = (req, res, next) => {
   try {
-    const { userId, type } = req.params;
-    
-    if (!req.user || req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Admin access required'
+    const identifier = req.user ? req.user.id : req.ip || req.connection.remoteAddress;
+    const key = req.route ? req.route.path : 'unknown';
+    const rateKey = `rate_limit:${key}:${identifier}`;
+
+    // Get current count and TTL
+    redisManager.getClient().multi()
+      .get(rateKey)
+      .ttl(rateKey)
+      .exec((err, results) => {
+        if (!err && results) {
+          const currentCount = parseInt(results[0]) || 0;
+          const ttl = results[1] || 0;
+
+          res.set({
+            'X-RateLimit-Current': currentCount,
+            'X-RateLimit-Reset': Math.floor(Date.now() / 1000) + ttl
+          });
+        }
+        next();
       });
-    }
-
-    const pattern = type ? `rate_limit:${type}:*:${userId}` : `rate_limit:*:${userId}`;
-    const keys = await redisManager.getClient().keys(pattern);
-    
-    if (keys.length > 0) {
-      await redisManager.getClient().del(...keys);
-    }
-
-    res.json({
-      success: true,
-      message: 'Rate limits reset successfully',
-      data: {
-        resetKeys: keys.length,
-        userId,
-        type: type || 'all'
-      }
-    });
 
   } catch (error) {
-    logger.error('Reset rate limit error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to reset rate limits'
-    });
+    logger.error('Rate limit info error:', error);
+    next();
   }
 };
 
+// Rate limit cleanup (remove expired entries)
+const cleanupRateLimits = async () => {
+  try {
+    // This would be called periodically to clean up expired rate limit keys
+    // Redis automatically expires keys, but we can add additional cleanup logic here
+    logger.debug('Rate limit cleanup completed');
+  } catch (error) {
+    logger.error('Rate limit cleanup error:', error);
+  }
+};
+
+// Export rate limiting functions
 module.exports = {
   rateLimiter,
+  dynamicRateLimiter,
+  burstRateLimiter,
+  slidingWindowRateLimiter,
   userRateLimiter,
   ipRateLimiter,
-  tierRateLimiter,
-  burstRateLimiter,
-  adaptiveRateLimiter,
-  globalRateLimiter,
-  getRateLimitStatus,
-  resetUserRateLimit
+  rateLimitInfo,
+  cleanupRateLimits
 };
