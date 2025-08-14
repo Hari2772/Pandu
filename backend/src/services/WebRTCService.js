@@ -3,614 +3,634 @@ const Recording = require('../models/Recording');
 const Analytics = require('../models/Analytics');
 const redisManager = require('../config/redis');
 const logger = require('../utils/logger');
+const constants = require('../utils/constants');
 
 class WebRTCService {
   constructor() {
-    this.activeConnections = new Map(); // callId -> connectionData
+    this.activeCalls = new Map(); // callId -> callData
+    this.screenSharing = new Map(); // userId -> screenShareData
+    this.recordingSessions = new Map(); // userId -> recordingData
     this.iceServers = this.getIceServers();
   }
 
   getIceServers() {
-    const defaultServers = [
+    return [
       { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:stun1.l.google.com:19302' },
-      { urls: 'stun:stun2.l.google.com:19302' }
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun3.l.google.com:19302' },
+      { urls: 'stun:stun4.l.google.com:19302' }
     ];
-
-    // Add TURN servers if configured
-    if (process.env.TURN_SERVERS) {
-      try {
-        const turnServers = JSON.parse(process.env.TURN_SERVERS);
-        defaultServers.push(...turnServers);
-      } catch (error) {
-        logger.error('Failed to parse TURN servers:', error);
-      }
-    }
-
-    return defaultServers;
   }
 
-  async handleCallOffer(socket, data) {
+  // Call Management
+  async initiateCall(callerId, recipientId, callType, isVideo = false) {
     try {
-      const { callId, offer, recipientId } = data;
-      const senderId = socket.userId;
-
-      // Validate call
-      const call = await Call.findById(callId);
-      if (!call || 
-          (call.callerId.toString() !== senderId.toString() && 
-           call.recipientId.toString() !== senderId.toString())) {
-        return socket.emit('error', { message: 'Invalid call' });
+      // Check if either user is already in a call
+      if (this.isUserInCall(callerId) || this.isUserInCall(recipientId)) {
+        throw new Error('User is already in a call');
       }
 
-      // Store connection data
-      if (!this.activeConnections.has(callId)) {
-        this.activeConnections.set(callId, {
-          callId,
-          callerId: call.callerId,
-          recipientId: call.recipientId,
-          offer: null,
-          answer: null,
-          iceCandidates: new Map(),
-          startTime: new Date(),
-          status: 'connecting'
-        });
-      }
-
-      const connection = this.activeConnections.get(callId);
-      connection.offer = offer;
-      connection.status = 'offer_received';
-
-      // Forward offer to recipient
-      const recipientSocketId = this.getUserSocketId(recipientId);
-      if (recipientSocketId) {
-        this.io.to(recipientSocketId).emit('call_offer_received', {
-          callId,
-          offer,
-          callerId: senderId,
-          iceServers: this.iceServers
-        });
-      }
-
-      // Track analytics
-      await Analytics.create({
-        eventType: 'call_offer_sent',
-        eventName: 'Call Offer Sent',
-        eventCategory: 'communication',
-        userId: senderId,
-        sessionId: socket.id,
-        platform: 'socket',
-        metadata: {
-          callId,
-          callType: call.callType
-        }
+      // Create call record
+      const call = new Call({
+        callerId,
+        recipientId,
+        callType: isVideo ? 'video' : callType,
+        status: 'initiating',
+        startTime: new Date()
       });
 
-      logger.info(`Call offer sent for call ${callId}`);
-
-    } catch (error) {
-      logger.error('Handle call offer error:', error);
-      socket.emit('error', { message: 'Failed to process call offer' });
-    }
-  }
-
-  async handleCallAnswer(socket, data) {
-    try {
-      const { callId, answer, recipientId } = data;
-      const senderId = socket.userId;
-
-      // Validate call
-      const call = await Call.findById(callId);
-      if (!call || 
-          (call.callerId.toString() !== senderId.toString() && 
-           call.recipientId.toString() !== senderId.toString())) {
-        return socket.emit('error', { message: 'Invalid call' });
-      }
-
-      const connection = this.activeConnections.get(callId);
-      if (!connection) {
-        return socket.emit('error', { message: 'Call connection not found' });
-      }
-
-      connection.answer = answer;
-      connection.status = 'answer_received';
-
-      // Forward answer to caller
-      const callerId = connection.callerId.equals(senderId) ? connection.recipientId : connection.callerId;
-      const callerSocketId = this.getUserSocketId(callerId);
-      if (callerSocketId) {
-        this.io.to(callerSocketId).emit('call_answer_received', {
-          callId,
-          answer,
-          recipientId: senderId
-        });
-      }
-
-      // Update call status
-      call.status = 'active';
-      call.answeredAt = new Date();
       await call.save();
 
+      // Store call data
+      const callData = {
+        callId: call._id,
+        callerId,
+        recipientId,
+        callType: call.callType,
+        startTime: new Date(),
+        status: 'initiating',
+        iceCandidates: new Map(), // userId -> [iceCandidates]
+        offers: new Map(), // userId -> offer
+        answers: new Map() // userId -> answer
+      };
+
+      this.activeCalls.set(call._id.toString(), callData);
+
       // Track analytics
       await Analytics.create({
-        eventType: 'call_answer_sent',
-        eventName: 'Call Answer Sent',
+        eventType: 'call_initiated',
+        eventName: 'WebRTC Call Initiated',
         eventCategory: 'communication',
-        userId: senderId,
-        sessionId: socket.id,
-        platform: 'socket',
+        userId: callerId,
+        platform: 'webrtc',
         metadata: {
-          callId,
-          callType: call.callType
+          callId: call._id,
+          callType: call.callType,
+          recipientId
         }
       });
 
-      logger.info(`Call answer sent for call ${callId}`);
+      logger.info(`WebRTC call initiated: ${call._id} from ${callerId} to ${recipientId}`);
+      return call;
 
     } catch (error) {
-      logger.error('Handle call answer error:', error);
-      socket.emit('error', { message: 'Failed to process call answer' });
+      logger.error('Initiate call error:', error);
+      throw error;
     }
   }
 
-  async handleIceCandidate(socket, data) {
+  async answerCall(callId, recipientId, answer) {
     try {
-      const { callId, candidate, recipientId } = data;
-      const senderId = socket.userId;
-
-      // Validate call
-      const call = await Call.findById(callId);
-      if (!call || 
-          (call.callerId.toString() !== senderId.toString() && 
-           call.recipientId.toString() !== senderId.toString())) {
-        return socket.emit('error', { message: 'Invalid call' });
+      const callData = this.activeCalls.get(callId.toString());
+      if (!callData) {
+        throw new Error('Call not found');
       }
 
-      const connection = this.activeConnections.get(callId);
-      if (!connection) {
-        return socket.emit('error', { message: 'Call connection not found' });
+      if (callData.recipientId.toString() !== recipientId.toString()) {
+        throw new Error('Unauthorized to answer this call');
+      }
+
+      // Store answer
+      callData.answers.set(recipientId.toString(), answer);
+      callData.status = 'active';
+
+      // Update call record
+      await Call.findByIdAndUpdate(callId, {
+        status: 'active',
+        answeredAt: new Date()
+      });
+
+      // Track analytics
+      await Analytics.create({
+        eventType: 'call_answered',
+        eventName: 'WebRTC Call Answered',
+        eventCategory: 'communication',
+        userId: recipientId,
+        platform: 'webrtc',
+        metadata: {
+          callId,
+          callType: callData.callType
+        }
+      });
+
+      logger.info(`WebRTC call answered: ${callId} by ${recipientId}`);
+      return callData;
+
+    } catch (error) {
+      logger.error('Answer call error:', error);
+      throw error;
+    }
+  }
+
+  async rejectCall(callId, recipientId, reason = 'rejected') {
+    try {
+      const callData = this.activeCalls.get(callId.toString());
+      if (!callData) {
+        throw new Error('Call not found');
+      }
+
+      // Update call record
+      await Call.findByIdAndUpdate(callId, {
+        status: 'rejected',
+        endedAt: new Date(),
+        endReason: reason
+      });
+
+      // Remove from active calls
+      this.activeCalls.delete(callId.toString());
+
+      // Track analytics
+      await Analytics.create({
+        eventType: 'call_ended',
+        eventName: 'WebRTC Call Rejected',
+        eventCategory: 'communication',
+        userId: recipientId,
+        platform: 'webrtc',
+        metadata: {
+          callId,
+          callType: callData.callType,
+          reason
+        }
+      });
+
+      logger.info(`WebRTC call rejected: ${callId} by ${recipientId}`);
+      return true;
+
+    } catch (error) {
+      logger.error('Reject call error:', error);
+      throw error;
+    }
+  }
+
+  async endCall(callId, userId, reason = 'ended') {
+    try {
+      const callData = this.activeCalls.get(callId.toString());
+      if (!callData) {
+        throw new Error('Call not found');
+      }
+
+      // Check if user is part of the call
+      if (callData.callerId.toString() !== userId.toString() && 
+          callData.recipientId.toString() !== userId.toString()) {
+        throw new Error('Unauthorized to end this call');
+      }
+
+      // Calculate call duration
+      const endTime = new Date();
+      const duration = callData.answeredAt ? 
+        (endTime - callData.answeredAt) / 1000 : 0;
+
+      // Update call record
+      await Call.findByIdAndUpdate(callId, {
+        status: 'ended',
+        endedAt: endTime,
+        endReason: reason,
+        duration: Math.round(duration)
+      });
+
+      // Remove from active calls
+      this.activeCalls.delete(callId.toString());
+
+      // Track analytics
+      await Analytics.create({
+        eventType: 'call_ended',
+        eventName: 'WebRTC Call Ended',
+        eventCategory: 'communication',
+        userId,
+        platform: 'webrtc',
+        duration: Math.round(duration),
+        metadata: {
+          callId,
+          callType: callData.callType,
+          reason,
+          duration: Math.round(duration)
+        }
+      });
+
+      logger.info(`WebRTC call ended: ${callId} by ${userId}, duration: ${duration}s`);
+      return true;
+
+    } catch (error) {
+      logger.error('End call error:', error);
+      throw error;
+    }
+  }
+
+  // ICE Candidate Management
+  async addIceCandidate(callId, userId, iceCandidate) {
+    try {
+      const callData = this.activeCalls.get(callId.toString());
+      if (!callData) {
+        throw new Error('Call not found');
+      }
+
+      // Check if user is part of the call
+      if (callData.callerId.toString() !== userId.toString() && 
+          callData.recipientId.toString() !== userId.toString()) {
+        throw new Error('Unauthorized to add ICE candidate');
       }
 
       // Store ICE candidate
-      if (!connection.iceCandidates.has(senderId)) {
-        connection.iceCandidates.set(senderId, []);
+      if (!callData.iceCandidates.has(userId.toString())) {
+        callData.iceCandidates.set(userId.toString(), []);
       }
-      connection.iceCandidates.get(senderId).push(candidate);
+      callData.iceCandidates.get(userId.toString()).push(iceCandidate);
 
-      // Forward ICE candidate to recipient
-      const recipientSocketId = this.getUserSocketId(recipientId);
-      if (recipientSocketId) {
-        this.io.to(recipientSocketId).emit('ice_candidate_received', {
-          callId,
-          candidate,
-          senderId
-        });
-      }
-
-      logger.debug(`ICE candidate forwarded for call ${callId}`);
+      logger.debug(`ICE candidate added for call ${callId} by user ${userId}`);
+      return true;
 
     } catch (error) {
-      logger.error('Handle ICE candidate error:', error);
-      socket.emit('error', { message: 'Failed to process ICE candidate' });
+      logger.error('Add ICE candidate error:', error);
+      throw error;
     }
   }
 
-  async handleScreenShareOffer(socket, data) {
+  async getIceCandidates(callId, userId) {
     try {
-      const { recipientId, offer, isVideo = false } = data;
-      const senderId = socket.userId;
+      const callData = this.activeCalls.get(callId.toString());
+      if (!callData) {
+        throw new Error('Call not found');
+      }
 
-      // Store screen sharing connection
-      const connectionId = `screen_share_${senderId}_${recipientId}`;
-      this.activeConnections.set(connectionId, {
-        connectionId,
-        type: 'screen_share',
-        sharerId: senderId,
+      // Get ICE candidates from the other user
+      const otherUserId = callData.callerId.toString() === userId.toString() ? 
+        callData.recipientId.toString() : callData.callerId.toString();
+
+      return callData.iceCandidates.get(otherUserId) || [];
+
+    } catch (error) {
+      logger.error('Get ICE candidates error:', error);
+      throw error;
+    }
+  }
+
+  // Offer/Answer Management
+  async setOffer(callId, userId, offer) {
+    try {
+      const callData = this.activeCalls.get(callId.toString());
+      if (!callData) {
+        throw new Error('Call not found');
+      }
+
+      // Check if user is part of the call
+      if (callData.callerId.toString() !== userId.toString() && 
+          callData.recipientId.toString() !== userId.toString()) {
+        throw new Error('Unauthorized to set offer');
+      }
+
+      callData.offers.set(userId.toString(), offer);
+      logger.debug(`Offer set for call ${callId} by user ${userId}`);
+      return true;
+
+    } catch (error) {
+      logger.error('Set offer error:', error);
+      throw error;
+    }
+  }
+
+  async getOffer(callId, userId) {
+    try {
+      const callData = this.activeCalls.get(callId.toString());
+      if (!callData) {
+        throw new Error('Call not found');
+      }
+
+      // Get offer from the other user
+      const otherUserId = callData.callerId.toString() === userId.toString() ? 
+        callData.recipientId.toString() : callData.callerId.toString();
+
+      return callData.offers.get(otherUserId);
+
+    } catch (error) {
+      logger.error('Get offer error:', error);
+      throw error;
+    }
+  }
+
+  // Screen Sharing
+  async startScreenShare(sharerId, recipientId, isVideo = false) {
+    try {
+      // Check if user is already screen sharing
+      if (this.screenSharing.has(sharerId.toString())) {
+        throw new Error('User is already screen sharing');
+      }
+
+      // Store screen sharing data
+      const screenShareData = {
+        sharerId,
         recipientId,
-        offer,
-        answer: null,
-        iceCandidates: new Map(),
         isVideo,
         startTime: new Date(),
-        status: 'offer_received'
-      });
+        status: 'active',
+        iceCandidates: new Map(),
+        offers: new Map(),
+        answers: new Map()
+      };
 
-      // Forward offer to recipient
-      const recipientSocketId = this.getUserSocketId(recipientId);
-      if (recipientSocketId) {
-        this.io.to(recipientSocketId).emit('screen_share_offer_received', {
-          connectionId,
-          offer,
-          sharerId: senderId,
-          isVideo,
-          iceServers: this.iceServers
-        });
-      }
+      this.screenSharing.set(sharerId.toString(), screenShareData);
 
       // Track analytics
       await Analytics.create({
-        eventType: 'screen_share_offer_sent',
-        eventName: 'Screen Share Offer Sent',
+        eventType: 'screen_share_started',
+        eventName: 'WebRTC Screen Share Started',
         eventCategory: 'media',
-        userId: senderId,
-        sessionId: socket.id,
-        platform: 'socket',
+        userId: sharerId,
+        platform: 'webrtc',
         metadata: {
           recipientId,
           isVideo
         }
       });
 
-      logger.info(`Screen share offer sent from ${senderId} to ${recipientId}`);
+      logger.info(`Screen sharing started by ${sharerId} to ${recipientId}`);
+      return screenShareData;
 
     } catch (error) {
-      logger.error('Handle screen share offer error:', error);
-      socket.emit('error', { message: 'Failed to process screen share offer' });
+      logger.error('Start screen share error:', error);
+      throw error;
     }
   }
 
-  async handleScreenShareAnswer(socket, data) {
+  async stopScreenShare(sharerId) {
     try {
-      const { connectionId, answer, sharerId } = data;
-      const senderId = socket.userId;
-
-      const connection = this.activeConnections.get(connectionId);
-      if (!connection || connection.recipientId.toString() !== senderId.toString()) {
-        return socket.emit('error', { message: 'Invalid screen share connection' });
+      const screenShareData = this.screenSharing.get(sharerId.toString());
+      if (!screenShareData) {
+        throw new Error('Screen sharing session not found');
       }
 
-      connection.answer = answer;
-      connection.status = 'answer_received';
+      // Calculate duration
+      const duration = (new Date() - screenShareData.startTime) / 1000;
 
-      // Forward answer to sharer
-      const sharerSocketId = this.getUserSocketId(sharerId);
-      if (sharerSocketId) {
-        this.io.to(sharerSocketId).emit('screen_share_answer_received', {
-          connectionId,
-          answer,
-          recipientId: senderId
-        });
-      }
+      // Remove from active sessions
+      this.screenSharing.delete(sharerId.toString());
 
       // Track analytics
       await Analytics.create({
-        eventType: 'screen_share_answer_sent',
-        eventName: 'Screen Share Answer Sent',
+        eventType: 'screen_share_stopped',
+        eventName: 'WebRTC Screen Share Stopped',
         eventCategory: 'media',
-        userId: senderId,
-        sessionId: socket.id,
-        platform: 'socket',
+        userId: sharerId,
+        platform: 'webrtc',
+        duration: Math.round(duration),
         metadata: {
-          connectionId,
-          isVideo: connection.isVideo
+          recipientId: screenShareData.recipientId,
+          duration: Math.round(duration)
         }
       });
 
-      logger.info(`Screen share answer sent for connection ${connectionId}`);
+      logger.info(`Screen sharing stopped by ${sharerId}, duration: ${duration}s`);
+      return true;
 
     } catch (error) {
-      logger.error('Handle screen share answer error:', error);
-      socket.emit('error', { message: 'Failed to process screen share answer' });
+      logger.error('Stop screen share error:', error);
+      throw error;
     }
   }
 
-  async handleScreenShareIceCandidate(socket, data) {
+  // Recording
+  async startRecording(userId, callId = null, type = 'audio') {
     try {
-      const { connectionId, candidate, recipientId } = data;
-      const senderId = socket.userId;
-
-      const connection = this.activeConnections.get(connectionId);
-      if (!connection || 
-          (connection.sharerId.toString() !== senderId.toString() && 
-           connection.recipientId.toString() !== senderId.toString())) {
-        return socket.emit('error', { message: 'Invalid screen share connection' });
-      }
-
-      // Store ICE candidate
-      if (!connection.iceCandidates.has(senderId)) {
-        connection.iceCandidates.set(senderId, []);
-      }
-      connection.iceCandidates.get(senderId).push(candidate);
-
-      // Forward ICE candidate to recipient
-      const recipientSocketId = this.getUserSocketId(recipientId);
-      if (recipientSocketId) {
-        this.io.to(recipientSocketId).emit('screen_share_ice_candidate_received', {
-          connectionId,
-          candidate,
-          senderId
-        });
-      }
-
-      logger.debug(`Screen share ICE candidate forwarded for connection ${connectionId}`);
-
-    } catch (error) {
-      logger.error('Handle screen share ICE candidate error:', error);
-      socket.emit('error', { message: 'Failed to process ICE candidate' });
-    }
-  }
-
-  async handleRecordingStart(socket, data) {
-    try {
-      const { callId, recordingType = 'audio', quality = 'medium' } = data;
-      const userId = socket.userId;
-
-      // Validate call
-      const call = await Call.findById(callId);
-      if (!call || 
-          (call.callerId.toString() !== userId.toString() && 
-           call.recipientId.toString() !== userId.toString())) {
-        return socket.emit('error', { message: 'Invalid call' });
-      }
-
-      // Check if call is active
-      if (call.status !== 'active') {
-        return socket.emit('error', { message: 'Call is not active' });
+      // Check if user is already recording
+      if (this.recordingSessions.has(userId.toString())) {
+        throw new Error('User is already recording');
       }
 
       // Create recording record
       const recording = new Recording({
+        userId,
         callId,
-        recorderId: userId,
-        recordingType,
-        quality,
+        type,
         status: 'recording',
         startTime: new Date()
       });
 
       await recording.save();
 
-      // Store recording session
-      this.recordingSessions.set(userId, {
+      // Store recording session data
+      const recordingData = {
         recordingId: recording._id,
+        userId,
         callId,
-        recordingType,
-        quality,
+        type,
         startTime: new Date(),
-        status: 'recording'
-      });
+        status: 'recording',
+        isPaused: false,
+        pauseTime: 0
+      };
 
-      // Notify other participant
-      const otherParticipantId = call.callerId.equals(userId) ? call.recipientId : call.callerId;
-      const otherParticipantSocketId = this.getUserSocketId(otherParticipantId);
-      if (otherParticipantSocketId) {
-        this.io.to(otherParticipantSocketId).emit('recording_started', {
-          callId,
-          recorderId: userId,
-          recordingType,
-          quality,
-          timestamp: new Date()
-        });
-      }
+      this.recordingSessions.set(userId.toString(), recordingData);
 
       // Track analytics
       await Analytics.create({
         eventType: 'recording_started',
-        eventName: 'Recording Started',
+        eventName: 'WebRTC Recording Started',
         eventCategory: 'media',
-        userId: userId,
-        sessionId: socket.id,
-        platform: 'socket',
+        userId,
+        platform: 'webrtc',
         metadata: {
+          recordingId: recording._id,
           callId,
-          recordingType,
-          quality
+          type
         }
       });
 
-      socket.emit('recording_started', {
-        recordingId: recording._id,
-        timestamp: new Date()
-      });
-
-      logger.info(`Recording started for call ${callId} by user ${userId}`);
+      logger.info(`Recording started by ${userId}, type: ${type}`);
+      return recording;
 
     } catch (error) {
-      logger.error('Handle recording start error:', error);
-      socket.emit('error', { message: 'Failed to start recording' });
+      logger.error('Start recording error:', error);
+      throw error;
     }
   }
 
-  async handleRecordingStop(socket, data) {
+  async stopRecording(userId) {
     try {
-      const { recordingId } = data;
-      const userId = socket.userId;
-
-      const recording = await Recording.findById(recordingId);
-      if (!recording || recording.recorderId.toString() !== userId.toString()) {
-        return socket.emit('error', { message: 'Invalid recording' });
+      const recordingData = this.recordingSessions.get(userId.toString());
+      if (!recordingData) {
+        throw new Error('Recording session not found');
       }
 
-      // Update recording
-      recording.status = 'completed';
-      recording.endTime = new Date();
-      recording.duration = recording.endTime - recording.startTime;
-      await recording.save();
+      // Calculate total duration
+      const endTime = new Date();
+      const totalDuration = (endTime - recordingData.startTime) / 1000;
+      const actualDuration = totalDuration - recordingData.pauseTime;
+
+      // Update recording record
+      await Recording.findByIdAndUpdate(recordingData.recordingId, {
+        status: 'completed',
+        endTime,
+        duration: Math.round(actualDuration)
+      });
 
       // Remove from active sessions
-      this.recordingSessions.delete(userId);
-
-      // Notify other participant
-      const call = await Call.findById(recording.callId);
-      if (call) {
-        const otherParticipantId = call.callerId.equals(userId) ? call.recipientId : call.callerId;
-        const otherParticipantSocketId = this.getUserSocketId(otherParticipantId);
-        if (otherParticipantSocketId) {
-          this.io.to(otherParticipantSocketId).emit('recording_stopped', {
-            callId: recording.callId,
-            recorderId: userId,
-            recordingId: recording._id,
-            duration: recording.duration,
-            timestamp: new Date()
-          });
-        }
-      }
+      this.recordingSessions.delete(userId.toString());
 
       // Track analytics
       await Analytics.create({
         eventType: 'recording_stopped',
-        eventName: 'Recording Stopped',
+        eventName: 'WebRTC Recording Stopped',
         eventCategory: 'media',
-        userId: userId,
-        sessionId: socket.id,
-        platform: 'socket',
+        userId,
+        platform: 'webrtc',
+        duration: Math.round(actualDuration),
         metadata: {
-          recordingId: recording._id,
-          callId: recording.callId,
-          duration: recording.duration
+          recordingId: recordingData.recordingId,
+          duration: Math.round(actualDuration)
         }
       });
 
-      socket.emit('recording_stopped', {
-        recordingId: recording._id,
-        duration: recording.duration,
-        timestamp: new Date()
-      });
+      logger.info(`Recording stopped by ${userId}, duration: ${actualDuration}s`);
+      return true;
 
-      logger.info(`Recording stopped for recording ${recordingId}`);
-
-    } catch (error) {
-      logger.error('Handle recording stop error:', error);
-      socket.emit('error', { message: 'Failed to stop recording' });
-    }
-  }
-
-  async endCall(callId, reason = 'ended') {
-    try {
-      const connection = this.activeConnections.get(callId);
-      if (connection) {
-        // Cleanup connection
-        this.activeConnections.delete(callId);
-
-        // Update call status
-        const call = await Call.findById(callId);
-        if (call) {
-          call.status = 'ended';
-          call.endedAt = new Date();
-          call.endReason = reason;
-          if (connection.startTime) {
-            call.duration = new Date() - connection.startTime;
-          }
-          await call.save();
-        }
-
-        // Stop any active recordings
-        for (const [userId, session] of this.recordingSessions.entries()) {
-          if (session.callId.toString() === callId) {
-            await this.stopRecording(userId, session.recordingId);
-          }
-        }
-
-        logger.info(`Call ${callId} ended: ${reason}`);
-      }
-    } catch (error) {
-      logger.error('End call error:', error);
-    }
-  }
-
-  async stopScreenShare(connectionId) {
-    try {
-      const connection = this.activeConnections.get(connectionId);
-      if (connection) {
-        // Cleanup connection
-        this.activeConnections.delete(connectionId);
-
-        // Notify participants
-        const recipientSocketId = this.getUserSocketId(connection.recipientId);
-        if (recipientSocketId) {
-          this.io.to(recipientSocketId).emit('screen_share_ended', {
-            connectionId,
-            sharerId: connection.sharerId,
-            timestamp: new Date()
-          });
-        }
-
-        logger.info(`Screen share ${connectionId} ended`);
-      }
-    } catch (error) {
-      logger.error('Stop screen share error:', error);
-    }
-  }
-
-  async stopRecording(userId, recordingId = null) {
-    try {
-      let session = null;
-      
-      if (recordingId) {
-        session = this.recordingSessions.get(userId);
-        if (session && session.recordingId.toString() === recordingId) {
-          this.recordingSessions.delete(userId);
-        }
-      } else {
-        session = this.recordingSessions.get(userId);
-        if (session) {
-          this.recordingSessions.delete(userId);
-        }
-      }
-
-      if (session) {
-        // Update recording if exists
-        const recording = await Recording.findById(session.recordingId);
-        if (recording && recording.status === 'recording') {
-          recording.status = 'completed';
-          recording.endTime = new Date();
-          recording.duration = recording.endTime - recording.startTime;
-          await recording.save();
-        }
-
-        logger.info(`Recording session ended for user ${userId}`);
-      }
     } catch (error) {
       logger.error('Stop recording error:', error);
+      throw error;
     }
   }
 
-  // Helper methods
-  getUserSocketId(userId) {
-    // This should be implemented to get socket ID from the main socket service
-    // For now, return null - this will be set by the main service
-    return null;
+  async pauseRecording(userId) {
+    try {
+      const recordingData = this.recordingSessions.get(userId.toString());
+      if (!recordingData) {
+        throw new Error('Recording session not found');
+      }
+
+      if (recordingData.isPaused) {
+        throw new Error('Recording is already paused');
+      }
+
+      recordingData.isPaused = true;
+      recordingData.pauseStartTime = new Date();
+
+      // Update recording record
+      await Recording.findByIdAndUpdate(recordingData.recordingId, {
+        status: 'paused',
+        pauseTime: new Date()
+      });
+
+      logger.info(`Recording paused by ${userId}`);
+      return true;
+
+    } catch (error) {
+      logger.error('Pause recording error:', error);
+      throw error;
+    }
   }
 
-  setSocketService(socketService) {
-    this.socketService = socketService;
-    this.io = socketService.io;
+  async resumeRecording(userId) {
+    try {
+      const recordingData = this.recordingSessions.get(userId.toString());
+      if (!recordingData) {
+        throw new Error('Recording session not found');
+      }
+
+      if (!recordingData.isPaused) {
+        throw new Error('Recording is not paused');
+      }
+
+      // Calculate pause duration
+      const pauseDuration = (new Date() - recordingData.pauseStartTime) / 1000;
+      recordingData.pauseTime += pauseDuration;
+      recordingData.isPaused = false;
+
+      // Update recording record
+      await Recording.findByIdAndUpdate(recordingData.recordingId, {
+        status: 'recording',
+        resumeTime: new Date()
+      });
+
+      logger.info(`Recording resumed by ${userId}`);
+      return true;
+
+    } catch (error) {
+      logger.error('Resume recording error:', error);
+      throw error;
+    }
   }
 
-  getConnectionStats() {
-    const stats = {
-      activeCalls: 0,
-      activeScreenShares: 0,
-      activeRecordings: 0,
-      totalConnections: this.activeConnections.size
-    };
-
-    for (const connection of this.activeConnections.values()) {
-      if (connection.type === 'screen_share') {
-        stats.activeScreenShares++;
-      } else {
-        stats.activeCalls++;
+  // Utility Methods
+  isUserInCall(userId) {
+    for (const [callId, callData] of this.activeCalls.entries()) {
+      if (callData.callerId.toString() === userId.toString() || 
+          callData.recipientId.toString() === userId.toString()) {
+        return callId;
       }
     }
-
-    stats.activeRecordings = this.recordingSessions.size;
-
-    return stats;
+    return false;
   }
 
-  cleanupInactiveConnections() {
+  isUserScreenSharing(userId) {
+    return this.screenSharing.has(userId.toString());
+  }
+
+  isUserRecording(userId) {
+    return this.recordingSessions.has(userId.toString());
+  }
+
+  getActiveCall(userId) {
+    const callId = this.isUserInCall(userId);
+    return callId ? this.activeCalls.get(callId) : null;
+  }
+
+  getScreenShareData(userId) {
+    return this.screenSharing.get(userId.toString());
+  }
+
+  getRecordingData(userId) {
+    return this.recordingSessions.get(userId.toString());
+  }
+
+  getAllActiveCalls() {
+    return Array.from(this.activeCalls.values());
+  }
+
+  getAllScreenSharing() {
+    return Array.from(this.screenSharing.values());
+  }
+
+  getAllRecordingSessions() {
+    return Array.from(this.recordingSessions.values());
+  }
+
+  // Cleanup Methods
+  cleanupExpiredSessions() {
     const now = Date.now();
-    const inactiveThreshold = 5 * 60 * 1000; // 5 minutes
-
-    for (const [id, connection] of this.activeConnections.entries()) {
-      if (now - connection.startTime.getTime() > inactiveThreshold) {
-        if (connection.type === 'screen_share') {
-          this.stopScreenShare(id);
-        } else {
-          this.endCall(id, 'timeout');
-        }
+    
+    // Cleanup expired calls (1 hour)
+    for (const [callId, callData] of this.activeCalls.entries()) {
+      if (now - callData.startTime > 3600000) {
+        this.activeCalls.delete(callId);
+        logger.warn(`Expired call cleaned up: ${callId}`);
       }
     }
+
+    // Cleanup expired screen sharing (30 minutes)
+    for (const [userId, screenShareData] of this.screenSharing.entries()) {
+      if (now - screenShareData.startTime > 1800000) {
+        this.screenSharing.delete(userId);
+        logger.warn(`Expired screen sharing cleaned up for user: ${userId}`);
+      }
+    }
+
+    // Cleanup expired recordings (2 hours)
+    for (const [userId, recordingData] of this.recordingSessions.entries()) {
+      if (now - recordingData.startTime > 7200000) {
+        this.recordingSessions.delete(userId);
+        logger.warn(`Expired recording session cleaned up for user: ${userId}`);
+      }
+    }
+  }
+
+  // Health Check
+  getHealthStatus() {
+    return {
+      activeCalls: this.activeCalls.size,
+      screenSharing: this.screenSharing.size,
+      recordingSessions: this.recordingSessions.size,
+      totalSessions: this.activeCalls.size + this.screenSharing.size + this.recordingSessions.size,
+      timestamp: new Date()
+    };
   }
 }
 

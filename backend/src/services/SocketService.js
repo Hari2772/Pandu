@@ -637,7 +637,8 @@ class SocketService {
         displayName: tierData.userId.displayName,
         profilePicture: tierData.userId.profilePicture,
         tier: tierData.userId.tier,
-        distance: this.calculateDistance(coordinates, tierData.location.coordinates)
+        distance: tierData.location.distance,
+        lastSeen: tierData.lastSeen
       }));
 
     } catch (error) {
@@ -646,27 +647,12 @@ class SocketService {
     }
   }
 
-  calculateDistance(coords1, coords2) {
-    const R = 6371; // Earth's radius in km
-    const dLat = (coords2[1] - coords1[1]) * Math.PI / 180;
-    const dLon = (coords2[0] - coords1[0]) * Math.PI / 180;
-    const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
-              Math.cos(coords1[1] * Math.PI / 180) * Math.cos(coords2[1] * Math.PI / 180) *
-              Math.sin(dLon/2) * Math.sin(dLon/2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-    return R * c;
-  }
-
   async handleDisconnection(socket) {
     try {
       const userId = socket.userId;
       if (!userId) return;
 
-      // Remove from connected users
-      this.connectedUsers.delete(userId);
-      this.userSessions.delete(userId);
-
-      // Update user status
+      // Update user offline status
       await User.findByIdAndUpdate(userId, {
         isOnline: false,
         lastSeen: new Date()
@@ -682,25 +668,53 @@ class SocketService {
         }
       );
 
-      // End active calls
-      const activeCall = this.activeCalls.get(userId);
-      if (activeCall) {
-        await this.endCall(activeCall.callId, 'disconnected');
-        this.activeCalls.delete(activeCall.callerId);
-        this.activeCalls.delete(activeCall.recipientId);
+      // Remove from active calls
+      if (this.activeCalls.has(userId)) {
+        const callData = this.activeCalls.get(userId);
+        this.activeCalls.delete(callData.callerId);
+        this.activeCalls.delete(callData.recipientId);
+        
+        // End call if active
+        if (callData.status === 'active') {
+          await Call.findByIdAndUpdate(callData.callId, {
+            status: 'ended',
+            endedAt: new Date()
+          });
+        }
       }
 
       // Stop screen sharing
-      const screenShare = this.screenSharing.get(userId);
-      if (screenShare) {
-        await this.stopScreenShare(userId);
+      if (this.screenSharing.has(userId)) {
+        const screenShareData = this.screenSharing.get(userId);
+        this.screenSharing.delete(userId);
+        
+        // Notify recipient
+        const recipientSocketId = this.connectedUsers.get(screenShareData.recipientId);
+        if (recipientSocketId) {
+          this.io.to(recipientSocketId).emit('screen_share_stopped', {
+            sharerId: userId,
+            timestamp: new Date()
+          });
+        }
       }
 
       // Stop recording
-      const recording = this.recordingSessions.get(userId);
-      if (recording) {
-        await this.stopRecording(userId);
+      if (this.recordingSessions.has(userId)) {
+        const recordingData = this.recordingSessions.get(userId);
+        this.recordingSessions.delete(userId);
+        
+        // End recording
+        if (recordingData.recordingId) {
+          await Recording.findByIdAndUpdate(recordingData.recordingId, {
+            status: 'completed',
+            endedAt: new Date()
+          });
+        }
       }
+
+      // Remove connection
+      this.connectedUsers.delete(userId);
+      this.userSessions.delete(userId);
 
       // Notify friends about offline status
       const user = await User.findById(userId).populate('friends.userId');
@@ -725,7 +739,11 @@ class SocketService {
         eventCategory: 'user',
         userId: userId,
         sessionId: socket.id,
-        platform: 'socket'
+        platform: 'socket',
+        metadata: {
+          socketId: socket.id,
+          reason: 'disconnection'
+        }
       });
 
       logger.info(`User ${userId} disconnected from Socket.IO`);
@@ -735,148 +753,57 @@ class SocketService {
     }
   }
 
-  async endCall(callId, reason = 'ended') {
-    try {
-      const call = await Call.findById(callId);
-      if (call) {
-        call.status = 'ended';
-        call.endedAt = new Date();
-        call.endReason = reason;
-        await call.save();
-
-        // Track analytics
-        await Analytics.create({
-          eventType: 'call_ended',
-          eventName: 'Call Ended',
-          eventCategory: 'communication',
-          userId: call.callerId,
-          platform: 'socket',
-          metadata: {
-            callId,
-            callType: call.callType,
-            reason,
-            duration: call.answeredAt ? new Date() - call.answeredAt : 0
-          }
-        });
-      }
-    } catch (error) {
-      logger.error('End call error:', error);
-    }
-  }
-
-  async stopScreenShare(userId) {
-    try {
-      const screenShare = this.screenSharing.get(userId);
-      if (screenShare) {
-        this.screenSharing.delete(userId);
-
-        // Notify recipient
-        const recipientSocketId = this.connectedUsers.get(screenShare.recipientId);
-        if (recipientSocketId) {
-          this.io.to(recipientSocketId).emit('screen_share_stopped', {
-            sharerId: userId,
-            timestamp: new Date()
-          });
-        }
-
-        // Track analytics
-        await Analytics.create({
-          eventType: 'screen_share_stopped',
-          eventName: 'Screen Share Stopped',
-          eventCategory: 'media',
-          userId: userId,
-          platform: 'socket',
-          metadata: {
-            recipientId: screenShare.recipientId,
-            duration: new Date() - screenShare.startTime
-          }
-        });
-      }
-    } catch (error) {
-      logger.error('Stop screen share error:', error);
-    }
-  }
-
-  async stopRecording(userId) {
-    try {
-      const recording = this.recordingSessions.get(userId);
-      if (recording) {
-        this.recordingSessions.delete(userId);
-
-        // Track analytics
-        await Analytics.create({
-          eventType: 'recording_stopped',
-          eventName: 'Recording Stopped',
-          eventCategory: 'media',
-          userId: userId,
-          platform: 'socket',
-          metadata: {
-            duration: new Date() - recording.startTime
-          }
-        });
-      }
-    } catch (error) {
-      logger.error('Stop recording error:', error);
-    }
-  }
-
   handleSocketError(socket, error) {
     logger.error('Socket error:', error);
     socket.emit('error', { message: 'Socket error occurred' });
   }
 
   setupCleanup() {
-    // Cleanup every 5 minutes
+    // Cleanup inactive sessions every 5 minutes
     setInterval(() => {
-      this.cleanupInactiveSessions();
-    }, 5 * 60 * 1000);
-  }
-
-  async cleanupInactiveSessions() {
-    try {
       const now = Date.now();
-      const inactiveThreshold = 30 * 60 * 1000; // 30 minutes
-
-      // Cleanup user sessions
       for (const [userId, session] of this.userSessions.entries()) {
-        if (now - session.lastMessage > inactiveThreshold) {
+        if (now - session.lastMessage > 300000) { // 5 minutes
           this.userSessions.delete(userId);
         }
       }
+    }, 300000);
 
-      // Cleanup expired calls
+    // Cleanup expired calls every minute
+    setInterval(() => {
+      const now = Date.now();
       for (const [userId, callData] of this.activeCalls.entries()) {
-        if (now - callData.startTime.getTime() > 2 * 60 * 60 * 1000) { // 2 hours
-          await this.endCall(callData.callId, 'timeout');
-          this.activeCalls.delete(callData.callerId);
-          this.activeCalls.delete(callData.recipientId);
+        if (now - callData.startTime > 3600000) { // 1 hour
+          this.activeCalls.delete(userId);
+          logger.warn(`Expired call cleaned up for user ${userId}`);
         }
       }
-
-    } catch (error) {
-      logger.error('Cleanup error:', error);
-    }
+    }, 60000);
   }
 
-  // Public methods for external use
-  getUserSocket(userId) {
-    return this.connectedUsers.get(userId);
-  }
-
+  // Utility methods
   isUserOnline(userId) {
     return this.connectedUsers.has(userId);
+  }
+
+  getUserSocketId(userId) {
+    return this.connectedUsers.get(userId);
   }
 
   getOnlineUsers() {
     return Array.from(this.connectedUsers.keys());
   }
 
+  broadcastToUser(userId, event, data) {
+    const socketId = this.connectedUsers.get(userId);
+    if (socketId) {
+      this.io.to(socketId).emit(event, data);
+    }
+  }
+
   broadcastToUsers(userIds, event, data) {
     userIds.forEach(userId => {
-      const socketId = this.connectedUsers.get(userId);
-      if (socketId) {
-        this.io.to(socketId).emit(event, data);
-      }
+      this.broadcastToUser(userId, event, data);
     });
   }
 
