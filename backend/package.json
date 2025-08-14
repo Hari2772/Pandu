@@ -1,0 +1,63 @@
+{
+  "name": "nearchat-backend",
+  "version": "1.0.0",
+  "description": "NearChat Viral Social Messaging Platform - Enterprise Backend",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "pm2 start ecosystem.config.js",
+    "dev": "nodemon src/server.js",
+    "build": "echo 'Production build complete'",
+    "test": "jest",
+    "lint": "eslint src/",
+    "docker:build": "docker build -t nearchat-backend .",
+    "docker:run": "docker-compose up -d"
+  },
+  "keywords": ["nearchat", "social", "messaging", "location", "real-time"],
+  "author": "NearChat Team",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.7.4",
+    "socket.io-redis": "^6.1.1",
+    "redis": "^4.6.10",
+    "mongoose": "^8.0.3",
+    "jsonwebtoken": "^9.0.2",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "helmet": "^7.1.0",
+    "express-rate-limit": "^7.1.5",
+    "express-validator": "^7.0.1",
+    "multer": "^1.4.5-lts.1",
+    "sharp": "^0.33.0",
+    "aws-sdk": "^2.1490.0",
+    "google-auth-library": "^9.0.0",
+    "node-cron": "^3.0.3",
+    "winston": "^3.11.0",
+    "compression": "^1.7.4",
+    "express-slow-down": "^2.0.1",
+    "express-mongo-sanitize": "^2.2.0",
+    "hpp": "^0.2.3",
+    "express-xss-clean": "^0.1.4",
+    "dotenv": "^16.3.1",
+    "uuid": "^9.0.1",
+    "moment": "^2.29.4",
+    "lodash": "^4.17.21",
+    "joi": "^17.11.0",
+    "node-geocoder": "^4.2.0",
+    "socket.io-adapter-redis": "^6.1.1",
+    "ioredis": "^5.3.2",
+    "pm2": "^5.3.0",
+    "cluster": "^0.7.7",
+    "os": "^0.1.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2",
+    "jest": "^29.7.0",
+    "eslint": "^8.55.0",
+    "supertest": "^6.3.3"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  }
+}
