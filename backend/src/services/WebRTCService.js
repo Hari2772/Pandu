@@ -2,493 +2,602 @@ const Call = require('../models/Call');
 const Recording = require('../models/Recording');
 const redisManager = require('../config/redis');
 const logger = require('../utils/logger');
+const constants = require('../utils/constants');
 
 class WebRTCService {
-  constructor(io) {
-    this.io = io;
+  constructor() {
     this.activeConnections = new Map(); // callId -> connection data
     this.screenShareSessions = new Map(); // sessionId -> session data
-    this.recordingSessions = new Map(); // callId -> recording data
+    this.recordingSessions = new Map(); // sessionId -> recording data
   }
 
-  // Handle WebRTC offer
-  async handleOffer(socket, data) {
+  // Initialize WebRTC connection
+  async initializeConnection(callId, callerId, receiverId, callType) {
     try {
-      const { callId, offer, targetUserId } = data;
-      const senderId = socket.userId;
+      const connectionData = {
+        callId,
+        callerId,
+        receiverId,
+        callType,
+        startTime: new Date(),
+        isActive: false,
+        participants: [callerId, receiverId],
+        mediaStreams: {
+          audio: false,
+          video: false,
+          screen: false
+        },
+        recording: {
+          isRecording: false,
+          sessionId: null,
+          startTime: null
+        },
+        screenShare: {
+          isActive: false,
+          sessionId: null,
+          sharerId: null
+        }
+      };
 
-      if (!callId || !offer || !targetUserId) {
-        socket.emit('error', { message: 'Invalid offer data' });
-        return;
-      }
+      this.activeConnections.set(callId, connectionData);
 
-      // Validate call
-      const call = await Call.findById(callId);
-      if (!call || (call.callerId.toString() !== senderId && call.receiverId.toString() !== senderId)) {
-        socket.emit('error', { message: 'Invalid call' });
-        return;
-      }
+      // Store connection data in Redis for persistence
+      await redisManager.getClient().setex(
+        `webrtc:connection:${callId}`,
+        3600, // 1 hour
+        JSON.stringify(connectionData)
+      );
 
-      // Store connection data
-      if (!this.activeConnections.has(callId)) {
-        this.activeConnections.set(callId, {
-          callId,
-          callerId: call.callerId,
-          receiverId: call.receiverId,
-          callType: call.callType,
-          startTime: new Date(),
-          participants: [call.callerId, call.receiverId]
-        });
-      }
-
-      // Forward offer to target user
-      const targetSocketId = this.getUserSocketId(targetUserId);
-      if (targetSocketId) {
-        this.io.to(targetSocketId).emit('webrtc_offer', {
-          callId,
-          offer,
-          fromUserId: senderId
-        });
-      }
-
-      logger.info(`WebRTC offer sent for call ${callId}`);
+      logger.info(`WebRTC connection initialized for call ${callId}`);
+      return connectionData;
 
     } catch (error) {
-      logger.error('Handle offer error:', error);
-      socket.emit('error', { message: 'Failed to process offer' });
+      logger.error('Initialize WebRTC connection error:', error);
+      throw error;
     }
   }
 
-  // Handle WebRTC answer
-  async handleAnswer(socket, data) {
+  // Handle ICE candidate exchange
+  async handleICECandidate(callId, fromUserId, candidate) {
     try {
-      const { callId, answer, targetUserId } = data;
-      const senderId = socket.userId;
-
-      if (!callId || !answer || !targetUserId) {
-        socket.emit('error', { message: 'Invalid answer data' });
-        return;
+      const connection = this.activeConnections.get(callId);
+      if (!connection) {
+        throw new Error('Connection not found');
       }
 
-      // Forward answer to target user
-      const targetSocketId = this.getUserSocketId(targetUserId);
-      if (targetSocketId) {
-        this.io.to(targetSocketId).emit('webrtc_answer', {
-          callId,
-          answer,
-          fromUserId: senderId
-        });
+      // Store ICE candidate in Redis for the other participant
+      const otherParticipant = connection.participants.find(id => id !== fromUserId);
+      if (otherParticipant) {
+        await redisManager.getClient().lpush(
+          `webrtc:ice:${callId}:${otherParticipant}`,
+          JSON.stringify({
+            fromUserId,
+            candidate,
+            timestamp: new Date()
+          })
+        );
+
+        // Set TTL for ICE candidates (5 minutes)
+        await redisManager.getClient().expire(
+          `webrtc:ice:${callId}:${otherParticipant}`,
+          300
+        );
       }
 
-      logger.info(`WebRTC answer sent for call ${callId}`);
-
-    } catch (error) {
-      logger.error('Handle answer error:', error);
-      socket.emit('error', { message: 'Failed to process answer' });
-    }
-  }
-
-  // Handle ICE candidate
-  async handleICECandidate(socket, data) {
-    try {
-      const { callId, candidate, targetUserId } = data;
-      const senderId = socket.userId;
-
-      if (!callId || !candidate || !targetUserId) return;
-
-      // Forward ICE candidate to target user
-      const targetSocketId = this.getUserSocketId(targetUserId);
-      if (targetSocketId) {
-        this.io.to(targetSocketId).emit('webrtc_ice_candidate', {
-          callId,
-          candidate,
-          fromUserId: senderId
-        });
-      }
+      logger.debug(`ICE candidate stored for call ${callId} from user ${fromUserId}`);
 
     } catch (error) {
       logger.error('Handle ICE candidate error:', error);
+      throw error;
     }
   }
 
-  // Handle screen share start
-  async handleScreenShareStart(socket, data) {
+  // Handle offer/answer exchange
+  async handleOfferAnswer(callId, fromUserId, type, sdp) {
     try {
-      const { callId, streamId, sessionId } = data;
-      const senderId = socket.userId;
-
-      if (!callId || !streamId || !sessionId) {
-        socket.emit('error', { message: 'Invalid screen share data' });
-        return;
+      const connection = this.activeConnections.get(callId);
+      if (!connection) {
+        throw new Error('Connection not found');
       }
 
-      // Validate call
-      const call = await Call.findById(callId);
-      if (!call || (call.callerId.toString() !== senderId && call.receiverId.toString() !== senderId)) {
-        socket.emit('error', { message: 'Invalid call' });
-        return;
+      // Store SDP in Redis for the other participant
+      const otherParticipant = connection.participants.find(id => id !== fromUserId);
+      if (otherParticipant) {
+        await redisManager.getClient().setex(
+          `webrtc:sdp:${callId}:${otherParticipant}`,
+          300, // 5 minutes
+          JSON.stringify({
+            fromUserId,
+            type,
+            sdp,
+            timestamp: new Date()
+          })
+        );
       }
 
-      // Create screen share session
-      const sessionData = {
+      logger.debug(`${type} stored for call ${callId} from user ${fromUserId}`);
+
+    } catch (error) {
+      logger.error('Handle offer/answer error:', error);
+      throw error;
+    }
+  }
+
+  // Start screen sharing
+  async startScreenShare(callId, sharerId, streamId) {
+    try {
+      const connection = this.activeConnections.get(callId);
+      if (!connection) {
+        throw new Error('Connection not found');
+      }
+
+      // Check if screen sharing is already active
+      if (connection.screenShare.isActive) {
+        throw new Error('Screen sharing already active');
+      }
+
+      const sessionId = `screenshare:${callId}:${Date.now()}`;
+      
+      // Update connection data
+      connection.screenShare = {
+        isActive: true,
         sessionId,
+        sharerId,
+        streamId,
+        startTime: new Date()
+      };
+
+      connection.mediaStreams.screen = true;
+
+      // Store screen share session
+      this.screenShareSessions.set(sessionId, {
         callId,
-        senderId,
+        sharerId,
         streamId,
         startTime: new Date(),
         isActive: true
-      };
-
-      this.screenShareSessions.set(sessionId, sessionData);
-
-      // Notify other participant
-      const otherUserId = call.callerId.toString() === senderId ? call.receiverId : call.callerId;
-      const otherSocketId = this.getUserSocketId(otherUserId);
-      
-      if (otherSocketId) {
-        this.io.to(otherSocketId).emit('screen_share_started', {
-          callId,
-          sessionId,
-          streamId,
-          fromUserId: senderId
-        });
-      }
-
-      // Update call with screen share info
-      await Call.findByIdAndUpdate(callId, {
-        hasScreenShare: true,
-        screenShareSessionId: sessionId
       });
 
-      logger.info(`Screen share started for call ${callId} by user ${senderId}`);
+      // Update Redis
+      await redisManager.getClient().setex(
+        `webrtc:connection:${callId}`,
+        3600,
+        JSON.stringify(connection)
+      );
 
-    } catch (error) {
-      logger.error('Screen share start error:', error);
-      socket.emit('error', { message: 'Failed to start screen share' });
-    }
-  }
+      await redisManager.getClient().setex(
+        `webrtc:screenshare:${sessionId}`,
+        3600,
+        JSON.stringify(this.screenShareSessions.get(sessionId))
+      );
 
-  // Handle screen share stop
-  async handleScreenShareStop(socket, data) {
-    try {
-      const { callId, sessionId } = data;
-      const senderId = socket.userId;
-
-      if (!callId || !sessionId) return;
-
-      const sessionData = this.screenShareSessions.get(sessionId);
-      if (!sessionData || sessionData.senderId.toString() !== senderId) {
-        socket.emit('error', { message: 'Invalid session' });
-        return;
-      }
-
-      // End session
-      sessionData.isActive = false;
-      sessionData.endTime = new Date();
-      this.screenShareSessions.set(sessionId, sessionData);
-
-      // Notify other participant
-      const call = await Call.findById(callId);
-      if (call) {
-        const otherUserId = call.callerId.toString() === senderId ? call.receiverId : call.callerId;
-        const otherSocketId = this.getUserSocketId(otherUserId);
-        
-        if (otherSocketId) {
-          this.io.to(otherSocketId).emit('screen_share_stopped', {
-            callId,
+      // Notify other participants
+      const otherParticipants = connection.participants.filter(id => id !== sharerId);
+      for (const participantId of otherParticipants) {
+        await redisManager.getClient().lpush(
+          `webrtc:events:${callId}:${participantId}`,
+          JSON.stringify({
+            type: 'screen_share_started',
             sessionId,
-            fromUserId: senderId
-          });
-        }
-
-        // Update call
-        await Call.findByIdAndUpdate(callId, {
-          hasScreenShare: false,
-          screenShareSessionId: null
-        });
+            sharerId,
+            timestamp: new Date()
+          })
+        );
       }
 
-      logger.info(`Screen share stopped for call ${callId} by user ${senderId}`);
+      logger.info(`Screen sharing started for call ${callId} by user ${sharerId}`);
+      return sessionId;
 
     } catch (error) {
-      logger.error('Screen share stop error:', error);
-      socket.emit('error', { message: 'Failed to stop screen share' });
+      logger.error('Start screen share error:', error);
+      throw error;
     }
   }
 
-  // Handle recording start
-  async handleRecordingStart(socket, data) {
+  // Stop screen sharing
+  async stopScreenShare(callId, sharerId) {
     try {
-      const { callId, recordingType = 'audio' } = data;
-      const senderId = socket.userId;
-
-      if (!callId) {
-        socket.emit('error', { message: 'Call ID required' });
-        return;
+      const connection = this.activeConnections.get(callId);
+      if (!connection) {
+        throw new Error('Connection not found');
       }
 
-      // Validate call
-      const call = await Call.findById(callId);
-      if (!call || (call.callerId.toString() !== senderId && call.receiverId.toString() !== senderId)) {
-        socket.emit('error', { message: 'Invalid call' });
-        return;
+      if (!connection.screenShare.isActive || connection.screenShare.sharerId !== sharerId) {
+        throw new Error('Screen sharing not active or unauthorized');
       }
 
-      // Check if recording already exists
-      if (this.recordingSessions.has(callId)) {
-        socket.emit('error', { message: 'Recording already in progress' });
-        return;
-      }
+      const sessionId = connection.screenShare.sessionId;
 
-      // Create recording session
-      const recordingData = {
-        callId,
-        startedBy: senderId,
-        recordingType,
-        startTime: new Date(),
-        isActive: true,
-        filePath: null
+      // Update connection data
+      connection.screenShare = {
+        isActive: false,
+        sessionId: null,
+        sharerId: null
       };
 
-      this.recordingSessions.set(callId, recordingData);
+      connection.mediaStreams.screen = false;
 
+      // Remove screen share session
+      this.screenShareSessions.delete(sessionId);
+
+      // Update Redis
+      await redisManager.getClient().setex(
+        `webrtc:connection:${callId}`,
+        3600,
+        JSON.stringify(connection)
+      );
+
+      await redisManager.getClient().del(`webrtc:screenshare:${sessionId}`);
+
+      // Notify other participants
+      const otherParticipants = connection.participants.filter(id => id !== sharerId);
+      for (const participantId of otherParticipants) {
+        await redisManager.getClient().lpush(
+          `webrtc:events:${callId}:${participantId}`,
+          JSON.stringify({
+            type: 'screen_share_stopped',
+            sessionId,
+            sharerId,
+            timestamp: new Date()
+          })
+        );
+      }
+
+      logger.info(`Screen sharing stopped for call ${callId} by user ${sharerId}`);
+
+    } catch (error) {
+      logger.error('Stop screen share error:', error);
+      throw error;
+    }
+  }
+
+  // Start call recording
+  async startRecording(callId, initiatorId) {
+    try {
+      const connection = this.activeConnections.get(callId);
+      if (!connection) {
+        throw new Error('Connection not found');
+      }
+
+      // Check if recording is already active
+      if (connection.recording.isRecording) {
+        throw new Error('Recording already active');
+      }
+
+      const sessionId = `recording:${callId}:${Date.now()}`;
+      
       // Create recording record
       const recording = new Recording({
         callId,
-        startedBy: senderId,
-        recordingType,
+        initiatorId,
+        sessionId,
         status: 'recording',
-        startTime: new Date()
+        startTime: new Date(),
+        callType: connection.callType
       });
 
       await recording.save();
 
-      // Notify other participant
-      const otherUserId = call.callerId.toString() === senderId ? call.receiverId : call.callerId;
-      const otherSocketId = this.getUserSocketId(otherUserId);
-      
-      if (otherSocketId) {
-        this.io.to(otherSocketId).emit('recording_started', {
-          callId,
-          recordingId: recording._id,
-          recordingType,
-          startedBy: senderId
-        });
-      }
-
-      // Update call
-      await Call.findByIdAndUpdate(callId, {
+      // Update connection data
+      connection.recording = {
         isRecording: true,
-        recordingId: recording._id
+        sessionId,
+        startTime: new Date()
+      };
+
+      // Store recording session
+      this.recordingSessions.set(sessionId, {
+        callId,
+        initiatorId,
+        recordingId: recording._id,
+        startTime: new Date(),
+        isActive: true
       });
 
-      logger.info(`Recording started for call ${callId} by user ${senderId}`);
+      // Update Redis
+      await redisManager.getClient().setex(
+        `webrtc:connection:${callId}`,
+        3600,
+        JSON.stringify(connection)
+      );
+
+      await redisManager.getClient().setex(
+        `webrtc:recording:${sessionId}`,
+        3600,
+        JSON.stringify(this.recordingSessions.get(sessionId))
+      );
+
+      // Notify participants
+      for (const participantId of connection.participants) {
+        await redisManager.getClient().lpush(
+          `webrtc:events:${callId}:${participantId}`,
+          JSON.stringify({
+            type: 'recording_started',
+            sessionId,
+            initiatorId,
+            timestamp: new Date()
+          })
+        );
+      }
+
+      logger.info(`Recording started for call ${callId} by user ${initiatorId}`);
+      return sessionId;
 
     } catch (error) {
-      logger.error('Recording start error:', error);
-      socket.emit('error', { message: 'Failed to start recording' });
+      logger.error('Start recording error:', error);
+      throw error;
     }
   }
 
-  // Handle recording stop
-  async handleRecordingStop(socket, data) {
+  // Stop call recording
+  async stopRecording(callId, initiatorId) {
     try {
-      const { callId } = data;
-      const senderId = socket.userId;
-
-      if (!callId) return;
-
-      const recordingData = this.recordingSessions.get(callId);
-      if (!recordingData) {
-        socket.emit('error', { message: 'No active recording' });
-        return;
+      const connection = this.activeConnections.get(callId);
+      if (!connection) {
+        throw new Error('Connection not found');
       }
 
-      // Check if user can stop recording
-      if (recordingData.startedBy.toString() !== senderId) {
-        socket.emit('error', { message: 'Only recording initiator can stop recording' });
-        return;
+      if (!connection.recording.isRecording) {
+        throw new Error('Recording not active');
       }
 
-      // End recording session
-      recordingData.isActive = false;
-      recordingData.endTime = new Date();
-      this.recordingSessions.set(callId, recordingData);
+      const sessionId = connection.recording.sessionId;
+      const recordingSession = this.recordingSessions.get(sessionId);
+
+      if (!recordingSession) {
+        throw new Error('Recording session not found');
+      }
 
       // Update recording record
-      await Recording.findByIdAndUpdate(recordingData.recordingId, {
+      await Recording.findByIdAndUpdate(recordingSession.recordingId, {
         status: 'completed',
         endTime: new Date(),
-        duration: new Date() - recordingData.startTime
+        duration: Date.now() - recordingSession.startTime.getTime()
       });
 
-      // Notify other participant
-      const call = await Call.findById(callId);
-      if (call) {
-        const otherUserId = call.callerId.toString() === senderId ? call.receiverId : call.callerId;
-        const otherSocketId = this.getUserSocketId(otherUserId);
-        
-        if (otherSocketId) {
-          this.io.to(otherSocketId).emit('recording_stopped', {
-            callId,
-            recordingId: recordingData.recordingId,
-            stoppedBy: senderId
-          });
-        }
+      // Update connection data
+      connection.recording = {
+        isRecording: false,
+        sessionId: null,
+        startTime: null
+      };
 
-        // Update call
-        await Call.findByIdAndUpdate(callId, {
-          isRecording: false,
-          recordingId: null
-        });
-      }
+      // Remove recording session
+      this.recordingSessions.delete(sessionId);
 
-      logger.info(`Recording stopped for call ${callId} by user ${senderId}`);
-
-    } catch (error) {
-      logger.error('Recording stop error:', error);
-      socket.emit('error', { message: 'Failed to stop recording' });
-    }
-  }
-
-  // Handle connection state change
-  async handleConnectionStateChange(socket, data) {
-    try {
-      const { callId, state, connectionId } = data;
-      const userId = socket.userId;
-
-      if (!callId || !state) return;
-
-      // Update connection state in Redis for monitoring
-      await redisManager.getClient().hset(
-        `call:${callId}:connections`,
-        connectionId || userId,
-        JSON.stringify({
-          state,
-          userId,
-          timestamp: new Date()
-        })
+      // Update Redis
+      await redisManager.getClient().setex(
+        `webrtc:connection:${callId}`,
+        3600,
+        JSON.stringify(connection)
       );
 
-      // Notify other participant
-      const call = await Call.findById(callId);
-      if (call) {
-        const otherUserId = call.callerId.toString() === userId ? call.receiverId : call.callerId;
-        const otherSocketId = this.getUserSocketId(otherUserId);
-        
-        if (otherSocketId) {
-          this.io.to(otherSocketId).emit('connection_state_change', {
-            callId,
-            state,
-            userId
-          });
-        }
-      }
+      await redisManager.getClient().del(`webrtc:recording:${sessionId}`);
 
-      logger.info(`Connection state changed to ${state} for call ${callId} by user ${userId}`);
-
-    } catch (error) {
-      logger.error('Connection state change error:', error);
-    }
-  }
-
-  // Handle bandwidth estimation
-  async handleBandwidthEstimation(socket, data) {
-    try {
-      const { callId, bandwidth, connectionQuality } = data;
-      const userId = socket.userId;
-
-      if (!callId || !bandwidth) return;
-
-      // Store bandwidth data in Redis for analytics
-      await redisManager.getClient().hset(
-        `call:${callId}:metrics`,
-        'bandwidth',
-        JSON.stringify({
-          userId,
-          bandwidth,
-          connectionQuality,
-          timestamp: new Date()
-        })
-      );
-
-      // Update call with quality metrics
-      await Call.findByIdAndUpdate(callId, {
-        $push: {
-          qualityMetrics: {
-            userId,
-            bandwidth,
-            connectionQuality,
+      // Notify participants
+      for (const participantId of connection.participants) {
+        await redisManager.getClient().lpush(
+          `webrtc:events:${callId}:${participantId}`,
+          JSON.stringify({
+            type: 'recording_stopped',
+            sessionId,
+            initiatorId,
             timestamp: new Date()
-          }
-        }
-      });
+          })
+        );
+      }
+
+      logger.info(`Recording stopped for call ${callId} by user ${initiatorId}`);
 
     } catch (error) {
-      logger.error('Bandwidth estimation error:', error);
+      logger.error('Stop recording error:', error);
+      throw error;
     }
   }
 
-  // Get active connections
-  getActiveConnections() {
-    return Array.from(this.activeConnections.values());
-  }
-
-  // Get screen share sessions
-  getScreenShareSessions() {
-    return Array.from(this.screenShareSessions.values()).filter(s => s.isActive);
-  }
-
-  // Get recording sessions
-  getRecordingSessions() {
-    return Array.from(this.recordingSessions.values()).filter(r => r.isActive);
-  }
-
-  // End call and cleanup
-  async endCall(callId) {
+  // Handle media stream state change
+  async handleMediaStreamChange(callId, userId, mediaType, isEnabled) {
     try {
-      // Cleanup active connections
+      const connection = this.activeConnections.get(callId);
+      if (!connection) {
+        throw new Error('Connection not found');
+      }
+
+      // Update media stream state
+      if (mediaType === 'audio' || mediaType === 'video') {
+        connection.mediaStreams[mediaType] = isEnabled;
+      }
+
+      // Update Redis
+      await redisManager.getClient().setex(
+        `webrtc:connection:${callId}`,
+        3600,
+        JSON.stringify(connection)
+      );
+
+      // Notify other participants
+      const otherParticipants = connection.participants.filter(id => id !== userId);
+      for (const participantId of otherParticipants) {
+        await redisManager.getClient().lpush(
+          `webrtc:events:${callId}:${participantId}`,
+          JSON.stringify({
+            type: 'media_stream_changed',
+            userId,
+            mediaType,
+            isEnabled,
+            timestamp: new Date()
+          })
+        );
+      }
+
+      logger.debug(`Media stream ${mediaType} ${isEnabled ? 'enabled' : 'disabled'} for user ${userId} in call ${callId}`);
+
+    } catch (error) {
+      logger.error('Handle media stream change error:', error);
+      throw error;
+    }
+  }
+
+  // Get connection data
+  async getConnectionData(callId) {
+    try {
+      // Try to get from memory first
+      let connection = this.activeConnections.get(callId);
+      
+      if (!connection) {
+        // Try to get from Redis
+        const redisData = await redisManager.getClient().get(`webrtc:connection:${callId}`);
+        if (redisData) {
+          connection = JSON.parse(redisData);
+          // Restore in memory
+          this.activeConnections.set(callId, connection);
+        }
+      }
+
+      return connection;
+
+    } catch (error) {
+      logger.error('Get connection data error:', error);
+      return null;
+    }
+  }
+
+  // Get pending events for user
+  async getPendingEvents(callId, userId) {
+    try {
+      const events = await redisManager.getClient().lrange(
+        `webrtc:events:${callId}:${userId}`,
+        0,
+        -1
+      );
+
+      // Clear events after reading
+      await redisManager.getClient().del(`webrtc:events:${callId}:${userId}`);
+
+      return events.map(event => JSON.parse(event));
+
+    } catch (error) {
+      logger.error('Get pending events error:', error);
+      return [];
+    }
+  }
+
+  // Get pending ICE candidates for user
+  async getPendingICECandidates(callId, userId) {
+    try {
+      const candidates = await redisManager.getClient().lrange(
+        `webrtc:ice:${callId}:${userId}`,
+        0,
+        -1
+      );
+
+      // Clear candidates after reading
+      await redisManager.getClient().del(`webrtc:ice:${callId}:${userId}`);
+
+      return candidates.map(candidate => JSON.parse(candidate));
+
+    } catch (error) {
+      logger.error('Get pending ICE candidates error:', error);
+      return [];
+    }
+  }
+
+  // Get pending SDP for user
+  async getPendingSDP(callId, userId) {
+    try {
+      const sdpData = await redisManager.getClient().get(`webrtc:sdp:${callId}:${userId}`);
+      
+      if (sdpData) {
+        // Clear SDP after reading
+        await redisManager.getClient().del(`webrtc:sdp:${callId}:${userId}`);
+        return JSON.parse(sdpData);
+      }
+
+      return null;
+
+    } catch (error) {
+      logger.error('Get pending SDP error:', error);
+      return null;
+    }
+  }
+
+  // End connection
+  async endConnection(callId) {
+    try {
+      const connection = this.activeConnections.get(callId);
+      if (!connection) return;
+
+      // Stop any active recording
+      if (connection.recording.isRecording) {
+        await this.stopRecording(callId, connection.recording.initiatorId);
+      }
+
+      // Stop any active screen sharing
+      if (connection.screenShare.isActive) {
+        await this.stopScreenShare(callId, connection.screenShare.sharerId);
+      }
+
+      // Remove from memory
       this.activeConnections.delete(callId);
 
-      // Stop screen sharing
-      const screenShareSessions = Array.from(this.screenShareSessions.values())
-        .filter(s => s.callId === callId);
-      
-      screenShareSessions.forEach(session => {
-        session.isActive = false;
-        session.endTime = new Date();
-      });
+      // Remove from Redis
+      await redisManager.getClient().del(`webrtc:connection:${callId}`);
 
-      // Stop recordings
-      const recordingData = this.recordingSessions.get(callId);
-      if (recordingData && recordingData.isActive) {
-        recordingData.isActive = false;
-        recordingData.endTime = new Date();
-
-        // Update recording record
-        await Recording.findByIdAndUpdate(recordingData.recordingId, {
-          status: 'interrupted',
-          endTime: new Date(),
-          duration: new Date() - recordingData.startTime
-        });
+      // Clear all related Redis keys
+      const keys = await redisManager.getClient().keys(`webrtc:*:${callId}:*`);
+      if (keys.length > 0) {
+        await redisManager.getClient().del(...keys);
       }
 
-      // Cleanup Redis data
-      await redisManager.getClient().del(`call:${callId}:connections`);
-      await redisManager.getClient().del(`call:${callId}:metrics`);
-
-      logger.info(`Call ${callId} ended and cleaned up`);
+      logger.info(`WebRTC connection ended for call ${callId}`);
 
     } catch (error) {
-      logger.error('End call cleanup error:', error);
+      logger.error('End connection error:', error);
     }
   }
 
-  // Helper method to get user socket ID
-  getUserSocketId(userId) {
-    // This would be implemented based on your socket management
-    // For now, returning null as placeholder
-    return null;
+  // Get active connections count
+  getActiveConnectionsCount() {
+    return this.activeConnections.size;
+  }
+
+  // Get active screen share sessions count
+  getActiveScreenShareSessionsCount() {
+    return this.screenShareSessions.size;
+  }
+
+  // Get active recording sessions count
+  getActiveRecordingSessionsCount() {
+    return this.recordingSessions.size;
+  }
+
+  // Clean up expired sessions
+  async cleanupExpiredSessions() {
+    try {
+      const now = new Date();
+      const expiryTime = 24 * 60 * 60 * 1000; // 24 hours
+
+      // Clean up expired screen share sessions
+      for (const [sessionId, session] of this.screenShareSessions.entries()) {
+        if (now - session.startTime > expiryTime) {
+          this.screenShareSessions.delete(sessionId);
+          await redisManager.getClient().del(`webrtc:screenshare:${sessionId}`);
+        }
+      }
+
+      // Clean up expired recording sessions
+      for (const [sessionId, session] of this.recordingSessions.entries()) {
+        if (now - session.startTime > expiryTime) {
+          this.recordingSessions.delete(sessionId);
+          await redisManager.getClient().del(`webrtc:recording:${sessionId}`);
+        }
+      }
+
+      logger.info('Expired WebRTC sessions cleaned up');
+
+    } catch (error) {
+      logger.error('Cleanup expired sessions error:', error);
+    }
   }
 }
 

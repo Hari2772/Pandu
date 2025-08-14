@@ -693,15 +693,26 @@ class SocketHandlers {
       const chat = await Chat.findById(chatId).populate('participants');
       if (!chat) return;
 
-      const offlineParticipants = chat.participants.filter(
+      const offlineUsers = chat.participants.filter(
         participant => !this.userSockets.has(participant._id.toString())
       );
 
-      // Send push notifications to offline users
-      offlineParticipants.forEach(participant => {
-        // This would integrate with a push notification service
-        logger.info(`Push notification sent to ${participant._id} for chat ${chatId}`);
-      });
+      // Store notification in Redis for offline users
+      for (const user of offlineUsers) {
+        if (user._id.toString() !== senderId) {
+          await redisManager.getClient().lpush(
+            `notifications:${user._id}`,
+            JSON.stringify({
+              type: 'new_message',
+              chatId,
+              messageId: message._id,
+              senderId,
+              content: message.content,
+              timestamp: new Date()
+            })
+          );
+        }
+      }
     } catch (error) {
       logger.error('Send push notification error:', error);
     }
@@ -713,9 +724,6 @@ class SocketHandlers {
       if (!user) return;
 
       const tier = user.tier || 5;
-      const radius = constants.TIER_DISTANCES[tier];
-
-      // Find nearby users in the same tier
       const nearbyUsers = await TierData.find({
         userId: { $ne: userId },
         isActive: true,
@@ -725,13 +733,12 @@ class SocketHandlers {
               type: 'Point',
               coordinates
             },
-            $maxDistance: radius
+            $maxDistance: constants.TIER_DISTANCES[tier]
           }
         }
       });
 
-      // Notify nearby users
-      nearbyUsers.forEach(nearbyUser => {
+      for (const nearbyUser of nearbyUsers) {
         const socketId = this.userSockets.get(nearbyUser.userId.toString());
         if (socketId) {
           this.io.to(socketId).emit('nearby_user_location_update', {
@@ -741,10 +748,21 @@ class SocketHandlers {
             timestamp: new Date()
           });
         }
-      });
+      }
     } catch (error) {
       logger.error('Broadcast location update error:', error);
     }
+  }
+
+  // Get user's active socket
+  getUserSocket(userId) {
+    const socketId = this.userSockets.get(userId.toString());
+    return socketId ? this.io.sockets.sockets.get(socketId) : null;
+  }
+
+  // Check if user is online
+  isUserOnline(userId) {
+    return this.userSockets.has(userId.toString());
   }
 
   // Get online users count
@@ -752,14 +770,9 @@ class SocketHandlers {
     return this.userSockets.size;
   }
 
-  // Get user socket ID
-  getUserSocketId(userId) {
-    return this.userSockets.get(userId.toString());
-  }
-
-  // Check if user is online
-  isUserOnline(userId) {
-    return this.userSockets.has(userId.toString());
+  // Get active calls count
+  getActiveCallsCount() {
+    return this.activeCalls.size;
   }
 }
 

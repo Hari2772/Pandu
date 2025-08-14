@@ -6,14 +6,24 @@ const constants = require('../utils/constants');
 
 class DiscoveryService {
   constructor() {
-    this.nearbyUsersCache = new Map(); // userId -> nearby users cache
-    this.tierUpdates = new Map(); // tier -> last update timestamp
-    this.discoveryStats = new Map(); // userId -> discovery stats
+    this.tierCache = new Map(); // tier -> tier data
+    this.locationCache = new Map(); // coordinates -> nearby users
+    this.userTierCache = new Map(); // userId -> tier info
   }
 
   // Update user location and tier
   async updateUserLocation(userId, coordinates, accuracy, address, placeName) {
     try {
+      // Validate coordinates
+      if (!coordinates || coordinates.length !== 2) {
+        throw new Error('Invalid coordinates');
+      }
+
+      const [longitude, latitude] = coordinates;
+      if (longitude < -180 || longitude > 180 || latitude < -90 || latitude > 90) {
+        throw new Error('Coordinates out of range');
+      }
+
       // Update user location
       await User.findByIdAndUpdate(userId, {
         'location.coordinates': coordinates,
@@ -23,51 +33,132 @@ class DiscoveryService {
         'location.placeName': placeName
       });
 
+      // Calculate tier based on location
+      const tier = await this.calculateUserTier(coordinates, userId);
+
       // Update tier data
-      const tierData = await TierData.findOne({ userId });
-      if (tierData) {
-        tierData.updateLocation(coordinates, accuracy, address, placeName);
-        await tierData.save();
-      }
+      await TierData.findOneAndUpdate(
+        { userId },
+        {
+          'location.coordinates': coordinates,
+          'location.accuracy': accuracy,
+          'location.lastUpdated': new Date(),
+          'location.address': address,
+          'location.placeName': placeName,
+          tier,
+          tierName: constants.TIER_NAMES[tier],
+          tierDistance: constants.TIER_DISTANCES[tier],
+          lastUpdate: new Date()
+        },
+        { upsert: true }
+      );
 
-      // Clear nearby users cache for this user
-      this.nearbyUsersCache.delete(userId);
+      // Update cache
+      this.userTierCache.set(userId.toString(), {
+        tier,
+        tierName: constants.TIER_NAMES[tier],
+        coordinates,
+        lastUpdate: new Date()
+      });
 
-      // Update discovery stats
-      this.updateDiscoveryStats(userId, 'location_update');
+      // Clear location cache for this area
+      this.clearLocationCache(coordinates);
 
-      logger.info(`Location updated for user ${userId}`);
+      // Notify nearby users of location update
+      await this.notifyNearbyUsers(userId, coordinates, tier);
 
-      return true;
+      logger.info(`User ${userId} location updated to tier ${tier}`);
+      return { tier, tierName: constants.TIER_NAMES[tier] };
+
     } catch (error) {
       logger.error('Update user location error:', error);
       throw error;
     }
   }
 
-  // Get nearby users based on tier
-  async getNearbyUsers(userId, options = {}) {
+  // Calculate user tier based on location
+  async calculateUserTier(coordinates, userId) {
+    try {
+      // Get user's current tier
+      const currentTierData = await TierData.findOne({ userId });
+      const currentTier = currentTierData ? currentTierData.tier : 5;
+
+      // Find nearby users in different tiers
+      const nearbyUsers = await TierData.find({
+        userId: { $ne: userId },
+        isActive: true,
+        'location.coordinates': {
+          $near: {
+            $geometry: {
+              type: 'Point',
+              coordinates
+            },
+            $maxDistance: constants.TIER_DISTANCES[6] // Max tier distance
+          }
+        }
+      }).sort({ 'location.lastUpdated': -1 });
+
+      // Calculate tier based on nearby user density
+      let tier = 5; // Default tier
+      const tierCounts = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0 };
+
+      nearbyUsers.forEach(user => {
+        if (user.tier && user.tier >= 1 && user.tier <= 6) {
+          tierCounts[user.tier]++;
+        }
+      });
+
+      // Tier calculation logic
+      const totalNearby = Object.values(tierCounts).reduce((a, b) => a + b, 0);
+      
+      if (totalNearby === 0) {
+        tier = 5; // No nearby users, default tier
+      } else if (totalNearby >= 50) {
+        tier = 1; // Very high density
+      } else if (totalNearby >= 30) {
+        tier = 2; // High density
+      } else if (totalNearby >= 20) {
+        tier = 3; // Medium-high density
+      } else if (totalNearby >= 10) {
+        tier = 4; // Medium density
+      } else if (totalNearby >= 5) {
+        tier = 5; // Low-medium density
+      } else {
+        tier = 6; // Low density
+      }
+
+      // Consider user's current tier for stability
+      if (Math.abs(tier - currentTier) <= 1) {
+        tier = currentTier; // Keep current tier if change is small
+      }
+
+      return tier;
+
+    } catch (error) {
+      logger.error('Calculate user tier error:', error);
+      return 5; // Default tier on error
+    }
+  }
+
+  // Discover nearby users
+  async discoverNearbyUsers(userId, options = {}) {
     try {
       const {
         tier = null,
         radius = null,
         limit = 50,
         includeOffline = false,
-        excludeFriends = false,
-        excludeBlocked = false,
-        minAge = null,
-        maxAge = null,
-        interests = [],
-        gender = null
+        minTier = 1,
+        maxTier = 6
       } = options;
 
-      // Get user's current tier and location
+      // Get user's location and tier
       const user = await User.findById(userId);
       if (!user || !user.location || !user.location.coordinates) {
-        return [];
+        throw new Error('User location not available');
       }
 
-      const userTier = tier || user.tier || 5;
+      const userTier = user.tier || 5;
       const searchRadius = radius || constants.TIER_DISTANCES[userTier];
 
       // Build query
@@ -86,8 +177,10 @@ class DiscoveryService {
       };
 
       // Filter by tier if specified
-      if (tier) {
+      if (tier !== null) {
         query.tier = tier;
+      } else {
+        query.tier = { $gte: minTier, $lte: maxTier };
       }
 
       // Filter by online status
@@ -96,97 +189,45 @@ class DiscoveryService {
       }
 
       // Get nearby users
-      let nearbyUsers = await TierData.find(query)
-        .populate('userId', 'username displayName profilePicture bio dateOfBirth gender interests')
+      const nearbyUsers = await TierData.find(query)
+        .populate('userId', 'username displayName profilePicture bio isOnline lastSeen')
         .limit(limit)
         .sort({ 'location.lastUpdated': -1 });
 
-      // Apply additional filters
-      if (excludeFriends || excludeBlocked || minAge || maxAge || interests.length > 0 || gender) {
-        const userIds = nearbyUsers.map(u => u.userId._id);
-        const userDetails = await User.find({
-          _id: { $in: userIds }
-        }).select('friends blockedUsers dateOfBirth interests gender');
-
-        nearbyUsers = nearbyUsers.filter(tierData => {
-          const userDetail = userDetails.find(u => u._id.toString() === tierData.userId._id.toString());
-          if (!userDetail) return false;
-
-          // Exclude friends
-          if (excludeFriends && userDetail.friends.some(f => f.userId.toString() === userId)) {
-            return false;
-          }
-
-          // Exclude blocked users
-          if (excludeBlocked && userDetail.blockedUsers.some(b => b.userId.toString() === userId)) {
-            return false;
-          }
-
-          // Filter by age
-          if (minAge || maxAge) {
-            const age = this.calculateAge(userDetail.dateOfBirth);
-            if (minAge && age < minAge) return false;
-            if (maxAge && age > maxAge) return false;
-          }
-
-          // Filter by interests
-          if (interests.length > 0) {
-            const userInterests = userDetail.interests || [];
-            const hasCommonInterest = interests.some(interest => 
-              userInterests.includes(interest)
-            );
-            if (!hasCommonInterest) return false;
-          }
-
-          // Filter by gender
-          if (gender && userDetail.gender !== gender) {
-            return false;
-          }
-
-          return true;
-        });
-      }
-
-      // Calculate distances and enrich data
-      const enrichedUsers = nearbyUsers.map(tierData => {
+      // Calculate distances and format response
+      const usersWithDistance = nearbyUsers.map(userData => {
         const distance = this.calculateDistance(
           user.location.coordinates,
-          tierData.location.coordinates
+          userData.location.coordinates
         );
 
         return {
-          id: tierData.userId._id,
-          username: tierData.userId.username,
-          displayName: tierData.userId.displayName,
-          profilePicture: tierData.userId.profilePicture,
-          bio: tierData.userId.bio,
-          tier: tierData.tier,
-          tierName: tierData.tierName,
+          id: userData.userId._id,
+          username: userData.userId.username,
+          displayName: userData.userId.displayName,
+          profilePicture: userData.userId.profilePicture,
+          bio: userData.userId.bio,
+          tier: userData.tier,
+          tierName: userData.tierName,
           distance: Math.round(distance),
-          isOnline: tierData.isOnline,
-          lastSeen: tierData.lastSeen,
-          lastUpdate: tierData.lastUpdate,
-          interests: tierData.userId.interests || [],
-          age: tierData.userId.dateOfBirth ? this.calculateAge(tierData.userId.dateOfBirth) : null
+          coordinates: userData.location.coordinates,
+          isOnline: userData.userId.isOnline,
+          lastSeen: userData.userId.lastSeen,
+          lastLocationUpdate: userData.location.lastUpdated
         };
       });
 
       // Sort by distance
-      enrichedUsers.sort((a, b) => a.distance - b.distance);
+      usersWithDistance.sort((a, b) => a.distance - b.distance);
 
       // Cache results
-      this.nearbyUsersCache.set(userId, {
-        users: enrichedUsers,
-        timestamp: new Date(),
-        options
-      });
+      this.cacheLocationResults(user.location.coordinates, usersWithDistance);
 
-      // Update discovery stats
-      this.updateDiscoveryStats(userId, 'discovery_request', enrichedUsers.length);
+      logger.info(`Discovered ${usersWithDistance.length} nearby users for user ${userId}`);
+      return usersWithDistance;
 
-      return enrichedUsers;
     } catch (error) {
-      logger.error('Get nearby users error:', error);
+      logger.error('Discover nearby users error:', error);
       throw error;
     }
   }
@@ -194,8 +235,13 @@ class DiscoveryService {
   // Get users by tier
   async getUsersByTier(tier, options = {}) {
     try {
-      const { page = 1, limit = 50, includeOffline = false, sortBy = 'lastUpdate' } = options;
+      const { page = 1, limit = 50, includeOffline = false } = options;
 
+      if (tier < 1 || tier > 6) {
+        throw new Error('Invalid tier number');
+      }
+
+      // Build query
       let query = {
         tier,
         isActive: true
@@ -205,24 +251,41 @@ class DiscoveryService {
         query.isOnline = true;
       }
 
+      // Get users
       const users = await TierData.find(query)
-        .populate('userId', 'username displayName profilePicture bio')
-        .sort({ [sortBy]: -1 })
+        .populate('userId', 'username displayName profilePicture bio isOnline lastSeen')
+        .sort({ lastUpdate: -1 })
         .skip((page - 1) * limit)
         .limit(limit);
 
-      return users.map(tierData => ({
-        id: tierData.userId._id,
-        username: tierData.userId.username,
-        displayName: tierData.userId.displayName,
-        profilePicture: tierData.userId.profilePicture,
-        bio: tierData.userId.bio,
-        tier: tierData.tier,
-        tierName: tierData.tierName,
-        isOnline: tierData.isOnline,
-        lastSeen: tierData.lastSeen,
-        lastUpdate: tierData.lastUpdate
+      // Format response
+      const formattedUsers = users.map(userData => ({
+        id: userData.userId._id,
+        username: userData.userId.username,
+        displayName: userData.userId.displayName,
+        profilePicture: userData.userId.profilePicture,
+        bio: userData.userId.bio,
+        tier: userData.tier,
+        tierName: userData.tierName,
+        coordinates: userData.location.coordinates,
+        isOnline: userData.userId.isOnline,
+        lastSeen: userData.userId.lastSeen,
+        lastLocationUpdate: userData.location.lastUpdated
       }));
+
+      // Get total count
+      const total = await TierData.countDocuments(query);
+
+      return {
+        users: formattedUsers,
+        pagination: {
+          page,
+          limit,
+          total,
+          pages: Math.ceil(total / limit)
+        }
+      };
+
     } catch (error) {
       logger.error('Get users by tier error:', error);
       throw error;
@@ -233,388 +296,304 @@ class DiscoveryService {
   async getTierStatistics() {
     try {
       const stats = await TierData.aggregate([
+        { $match: { isActive: true } },
         {
           $group: {
             _id: '$tier',
-            userCount: { $sum: 1 },
+            count: { $sum: 1 },
             onlineCount: {
               $sum: { $cond: ['$isOnline', 1, 0] }
             },
-            avgDistance: { $avg: '$tierDistance' }
+            avgLastUpdate: { $avg: '$lastUpdate' }
           }
         },
-        {
-          $project: {
-            tier: '$_id',
-            userCount: 1,
-            onlineCount: 1,
-            avgDistance: { $round: ['$avgDistance', 2] },
-            tierName: {
-              $switch: {
-                branches: [
-                  { case: { $eq: ['$_id', 1] }, then: 'Immediate' },
-                  { case: { $eq: ['$_id', 2] }, then: 'Very Close' },
-                  { case: { $eq: ['$_id', 3] }, then: 'Close' },
-                  { case: { $eq: ['$_id', 4] }, then: 'Nearby' },
-                  { case: { $eq: ['$_id', 5] }, then: 'Regional' },
-                  { case: { $eq: ['$_id', 6] }, then: 'Extended' }
-                ],
-                default: 'Unknown'
-              }
-            }
-          }
-        },
-        { $sort: { tier: 1 } }
+        { $sort: { _id: 1 } }
       ]);
 
-      return stats;
+      // Format statistics
+      const tierStats = {};
+      for (let i = 1; i <= 6; i++) {
+        const tierData = stats.find(s => s._id === i);
+        tierStats[i] = {
+          tier: i,
+          tierName: constants.TIER_NAMES[i],
+          totalUsers: tierData ? tierData.count : 0,
+          onlineUsers: tierData ? tierData.onlineCount : 0,
+          avgLastUpdate: tierData ? tierData.avgLastUpdate : null,
+          tierDistance: constants.TIER_DISTANCES[i]
+        };
+      }
+
+      return tierStats;
+
     } catch (error) {
       logger.error('Get tier statistics error:', error);
       throw error;
     }
   }
 
-  // Get user discovery stats
-  async getUserDiscoveryStats(userId) {
+  // Get user's tier information
+  async getUserTierInfo(userId) {
     try {
-      const stats = this.discoveryStats.get(userId) || {
-        totalRequests: 0,
-        totalUsersFound: 0,
-        lastRequest: null,
-        favoriteTiers: new Map(),
-        averageDistance: 0
+      // Check cache first
+      if (this.userTierCache.has(userId.toString())) {
+        const cached = this.userTierCache.get(userId.toString());
+        if (Date.now() - cached.lastUpdate.getTime() < 300000) { // 5 minutes
+          return cached;
+        }
+      }
+
+      // Get from database
+      const tierData = await TierData.findOne({ userId });
+      if (!tierData) {
+        throw new Error('User tier data not found');
+      }
+
+      const tierInfo = {
+        tier: tierData.tier,
+        tierName: tierData.tierName,
+        tierDistance: tierData.tierDistance,
+        coordinates: tierData.location.coordinates,
+        lastUpdate: tierData.lastUpdate
       };
 
-      // Get recent discovery history from Redis
-      const recentDiscoveries = await redisManager.getClient().lrange(
-        `discovery:${userId}:history`,
-        0, 9
+      // Update cache
+      this.userTierCache.set(userId.toString(), tierInfo);
+
+      return tierInfo;
+
+    } catch (error) {
+      logger.error('Get user tier info error:', error);
+      throw error;
+    }
+  }
+
+  // Update user tier manually (admin function)
+  async updateUserTier(userId, newTier, reason = '') {
+    try {
+      if (newTier < 1 || newTier > 6) {
+        throw new Error('Invalid tier number');
+      }
+
+      // Update tier data
+      await TierData.findOneAndUpdate(
+        { userId },
+        {
+          tier: newTier,
+          tierName: constants.TIER_NAMES[newTier],
+          tierDistance: constants.TIER_DISTANCES[newTier],
+          tierUpdateReason: reason,
+          tierUpdatedAt: new Date(),
+          lastUpdate: new Date()
+        }
       );
 
-      const history = recentDiscoveries.map(discovery => JSON.parse(discovery));
-
-      return {
-        ...stats,
-        history,
-        lastRequest: stats.lastRequest ? new Date(stats.lastRequest) : null
-      };
-    } catch (error) {
-      logger.error('Get user discovery stats error:', error);
-      return {};
-    }
-  }
-
-  // Get popular locations
-  async getPopularLocations(options = {}) {
-    try {
-      const { limit = 20, radius = 10000 } = options;
-
-      const locations = await TierData.aggregate([
-        {
-          $match: {
-            'location.coordinates': { $exists: true },
-            isActive: true
-          }
-        },
-        {
-          $group: {
-            _id: {
-              city: '$location.city',
-              coordinates: '$location.coordinates'
-            },
-            userCount: { $sum: 1 },
-            onlineCount: {
-              $sum: { $cond: ['$isOnline', 1, 0] }
-            },
-            tiers: { $addToSet: '$tier' }
-          }
-        },
-        {
-          $project: {
-            city: '$_id.city',
-            coordinates: '$_id.coordinates',
-            userCount: 1,
-            onlineCount: 1,
-            tierCount: { $size: '$tiers' },
-            avgTier: { $avg: '$tiers' }
-          }
-        },
-        { $sort: { userCount: -1 } },
-        { $limit: limit }
-      ]);
-
-      return locations;
-    } catch (error) {
-      logger.error('Get popular locations error:', error);
-      throw error;
-    }
-  }
-
-  // Get users in specific area
-  async getUsersInArea(coordinates, radius, options = {}) {
-    try {
-      const { limit = 100, includeOffline = false, minTier = 1, maxTier = 6 } = options;
-
-      let query = {
-        'location.coordinates': {
-          $near: {
-            $geometry: {
-              type: 'Point',
-              coordinates
-            },
-            $maxDistance: radius
-          }
-        },
-        tier: { $gte: minTier, $lte: maxTier },
-        isActive: true
-      };
-
-      if (!includeOffline) {
-        query.isOnline = true;
-      }
-
-      const users = await TierData.find(query)
-        .populate('userId', 'username displayName profilePicture bio')
-        .limit(limit)
-        .sort({ 'location.lastUpdated': -1 });
-
-      return users.map(tierData => {
-        const distance = this.calculateDistance(coordinates, tierData.location.coordinates);
-        
-        return {
-          id: tierData.userId._id,
-          username: tierData.userId.username,
-          displayName: tierData.userId.displayName,
-          profilePicture: tierData.userId.profilePicture,
-          bio: tierData.userId.bio,
-          tier: tierData.tier,
-          tierName: tierData.tierName,
-          distance: Math.round(distance),
-          isOnline: tierData.isOnline,
-          lastSeen: tierData.lastSeen,
-          coordinates: tierData.location.coordinates
-        };
+      // Update user model
+      await User.findByIdAndUpdate(userId, {
+        tier: newTier
       });
+
+      // Update cache
+      this.userTierCache.set(userId.toString(), {
+        tier: newTier,
+        tierName: constants.TIER_NAMES[newTier],
+        tierDistance: constants.TIER_DISTANCES[newTier],
+        lastUpdate: new Date()
+      });
+
+      logger.info(`User ${userId} tier updated to ${newTier} by admin`);
+      return { tier: newTier, tierName: constants.TIER_NAMES[newTier] };
+
     } catch (error) {
-      logger.error('Get users in area error:', error);
+      logger.error('Update user tier error:', error);
       throw error;
     }
   }
 
-  // Get discovery recommendations
-  async getDiscoveryRecommendations(userId, options = {}) {
+  // Get nearby users count by tier
+  async getNearbyUsersCount(userId, radius = null) {
     try {
-      const { limit = 20, excludeRecent = true } = options;
-
-      // Get user's recent discoveries
-      let excludeUserIds = [userId];
-      if (excludeRecent) {
-        const recentDiscoveries = await redisManager.getClient().lrange(
-          `discovery:${userId}:recent`,
-          0, 49
-        );
-        excludeUserIds.push(...recentDiscoveries.map(id => id.toString()));
-      }
-
-      // Get user's current location and preferences
       const user = await User.findById(userId);
-      if (!user || !user.location) {
-        return [];
+      if (!user || !user.location || !user.location.coordinates) {
+        return { total: 0, byTier: {} };
       }
 
-      // Get recommendations based on location and interests
-      const recommendations = await TierData.aggregate([
+      const searchRadius = radius || constants.TIER_DISTANCES[user.tier || 5];
+
+      const counts = await TierData.aggregate([
         {
           $match: {
-            userId: { $nin: excludeUserIds.map(id => require('mongoose').Types.ObjectId(id)) },
+            userId: { $ne: userId },
             isActive: true,
-            isOnline: true,
-            'location.coordinates': { $exists: true }
-          }
-        },
-        {
-          $addFields: {
-            distance: {
-              $geoNear: {
-                near: user.location.coordinates,
-                distanceField: 'distance',
-                spherical: true
+            'location.coordinates': {
+              $near: {
+                $geometry: {
+                  type: 'Point',
+                  coordinates: user.location.coordinates
+                },
+                $maxDistance: searchRadius
               }
             }
           }
         },
         {
-          $lookup: {
-            from: 'users',
-            localField: 'userId',
-            foreignField: '_id',
-            as: 'userDetails'
+          $group: {
+            _id: '$tier',
+            count: { $sum: 1 }
           }
         },
-        {
-          $unwind: '$userDetails'
-        },
-        {
-          $addFields: {
-            interestMatch: {
-              $size: {
-                $setIntersection: [
-                  user.interests || [],
-                  '$userDetails.interests'
-                ]
-              }
-          }
-        },
-        {
-          $sort: {
-            interestMatch: -1,
-            distance: 1
-          }
-        },
-        { $limit: limit }
+        { $sort: { _id: 1 } }
       ]);
 
-      return recommendations.map(rec => ({
-        id: rec.userId,
-        username: rec.userDetails.username,
-        displayName: rec.userDetails.displayName,
-        profilePicture: rec.userDetails.profilePicture,
-        bio: rec.userDetails.bio,
-        tier: rec.tier,
-        tierName: rec.tierName,
-        distance: Math.round(rec.distance),
-        interestMatch: rec.interestMatch,
-        interests: rec.userDetails.interests || []
-      }));
+      // Format response
+      const byTier = {};
+      let total = 0;
+
+      for (let i = 1; i <= 6; i++) {
+        const tierData = counts.find(c => c._id === i);
+        byTier[i] = tierData ? tierData.count : 0;
+        total += byTier[i];
+      }
+
+      return { total, byTier };
+
     } catch (error) {
-      logger.error('Get discovery recommendations error:', error);
-      throw error;
+      logger.error('Get nearby users count error:', error);
+      return { total: 0, byTier: {} };
     }
   }
 
-  // Update discovery stats
-  updateDiscoveryStats(userId, action, data = null) {
+  // Helper methods
+  calculateDistance(coords1, coords2) {
     try {
-      if (!this.discoveryStats.has(userId)) {
-        this.discoveryStats.set(userId, {
-          totalRequests: 0,
-          totalUsersFound: 0,
-          lastRequest: null,
-          favoriteTiers: new Map(),
-          averageDistance: 0
-        });
-      }
+      const [lon1, lat1] = coords1;
+      const [lon2, lat2] = coords2;
 
-      const stats = this.discoveryStats.get(userId);
-
-      switch (action) {
-        case 'discovery_request':
-          stats.totalRequests++;
-          stats.lastRequest = new Date();
-          if (data) {
-            stats.totalUsersFound += data;
-            // Update average distance if available
-            // This would require more complex calculation
-          }
-          break;
-
-        case 'location_update':
-          stats.lastRequest = new Date();
-          break;
-
-        case 'tier_change':
-          if (data) {
-            const currentCount = stats.favoriteTiers.get(data) || 0;
-            stats.favoriteTiers.set(data, currentCount + 1);
-          }
-          break;
-      }
-
-      this.discoveryStats.set(userId, stats);
-    } catch (error) {
-      logger.error('Update discovery stats error:', error);
-    }
-  }
-
-  // Calculate distance between two coordinates
-  calculateDistance(coord1, coord2) {
-    try {
       const R = 6371; // Earth's radius in kilometers
-      const dLat = this.deg2rad(coord2[1] - coord1[1]);
-      const dLon = this.deg2rad(coord2[0] - coord1[0]);
-      
+      const dLat = this.toRadians(lat2 - lat1);
+      const dLon = this.toRadians(lon2 - lon1);
+
       const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-                Math.cos(this.deg2rad(coord1[1])) * Math.cos(this.deg2rad(coord2[1])) *
+                Math.cos(this.toRadians(lat1)) * Math.cos(this.toRadians(lat2)) *
                 Math.sin(dLon / 2) * Math.sin(dLon / 2);
-      
+
       const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-      const distance = R * c; // Distance in kilometers
-      
-      return distance * 1000; // Convert to meters
+      const distance = R * c;
+
+      return distance;
     } catch (error) {
       logger.error('Calculate distance error:', error);
       return 0;
     }
   }
 
-  // Convert degrees to radians
-  deg2rad(deg) {
-    return deg * (Math.PI / 180);
+  toRadians(degrees) {
+    return degrees * (Math.PI / 180);
   }
 
-  // Calculate age from date of birth
-  calculateAge(dateOfBirth) {
+  cacheLocationResults(coordinates, results) {
     try {
-      if (!dateOfBirth) return null;
-      
-      const today = new Date();
-      const birthDate = new Date(dateOfBirth);
-      let age = today.getFullYear() - birthDate.getFullYear();
-      const monthDiff = today.getMonth() - birthDate.getMonth();
-      
-      if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) {
-        age--;
+      const key = `${Math.round(coordinates[0] * 100) / 100},${Math.round(coordinates[1] * 100) / 100}`;
+      this.locationCache.set(key, {
+        results,
+        timestamp: Date.now()
+      });
+
+      // Limit cache size
+      if (this.locationCache.size > 1000) {
+        const firstKey = this.locationCache.keys().next().value;
+        this.locationCache.delete(firstKey);
       }
-      
-      return age;
     } catch (error) {
-      logger.error('Calculate age error:', error);
-      return null;
+      logger.error('Cache location results error:', error);
     }
   }
 
-  // Cleanup old cache entries
-  cleanupCache() {
+  clearLocationCache(coordinates) {
+    try {
+      const key = `${Math.round(coordinates[0] * 100) / 100},${Math.round(coordinates[1] * 100) / 100}`;
+      this.locationCache.delete(key);
+    } catch (error) {
+      logger.error('Clear location cache error:', error);
+    }
+  }
+
+  async notifyNearbyUsers(userId, coordinates, tier) {
+    try {
+      // Find users in nearby tiers
+      const nearbyUsers = await TierData.find({
+        userId: { $ne: userId },
+        isActive: true,
+        isOnline: true,
+        $or: [
+          { tier: tier },
+          { tier: tier - 1 },
+          { tier: tier + 1 }
+        ].filter(t => t >= 1 && t <= 6),
+        'location.coordinates': {
+          $near: {
+            $geometry: {
+              type: 'Point',
+              coordinates
+            },
+            $maxDistance: constants.TIER_DISTANCES[Math.max(tier, 6)]
+          }
+        }
+      }).limit(20);
+
+      // Store notifications in Redis for real-time delivery
+      for (const user of nearbyUsers) {
+        await redisManager.getClient().lpush(
+          `notifications:${user.userId}`,
+          JSON.stringify({
+            type: 'nearby_user_update',
+            userId,
+            coordinates,
+            tier,
+            timestamp: new Date()
+          })
+        );
+      }
+
+    } catch (error) {
+      logger.error('Notify nearby users error:', error);
+    }
+  }
+
+  // Get service statistics
+  getServiceStats() {
+    return {
+      tierCacheSize: this.tierCache.size,
+      locationCacheSize: this.locationCache.size,
+      userTierCacheSize: this.userTierCache.size
+    };
+  }
+
+  // Clean up expired cache data
+  async cleanupExpiredCache() {
     try {
       const now = Date.now();
-      const cacheTimeout = 5 * 60 * 1000; // 5 minutes
+      const expiryTime = 30 * 60 * 1000; // 30 minutes
 
-      for (const [userId, cache] of this.nearbyUsersCache.entries()) {
-        if (now - cache.timestamp > cacheTimeout) {
-          this.nearbyUsersCache.delete(userId);
+      // Clean up location cache
+      for (const [key, data] of this.locationCache.entries()) {
+        if (now - data.timestamp > expiryTime) {
+          this.locationCache.delete(key);
         }
       }
 
-      // Cleanup old discovery stats
-      const statsTimeout = 24 * 60 * 60 * 1000; // 24 hours
-      for (const [userId, stats] of this.discoveryStats.entries()) {
-        if (stats.lastRequest && (now - stats.lastRequest) > statsTimeout) {
-          this.discoveryStats.delete(userId);
+      // Clean up user tier cache
+      for (const [key, data] of this.userTierCache.entries()) {
+        if (now - data.lastUpdate.getTime() > expiryTime) {
+          this.userTierCache.delete(key);
         }
       }
+
+      logger.info('Discovery service cache cleanup completed');
+
     } catch (error) {
-      logger.error('Cleanup cache error:', error);
+      logger.error('Discovery service cache cleanup error:', error);
     }
-  }
-
-  // Get service health status
-  getHealthStatus() {
-    return {
-      nearbyUsersCacheSize: this.nearbyUsersCache.size,
-      discoveryStatsSize: this.discoveryStats.size,
-      tierUpdatesSize: this.tierUpdates.size,
-      timestamp: new Date()
-    };
   }
 }
 

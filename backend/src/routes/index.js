@@ -5,6 +5,7 @@ const router = express.Router();
 const authRoutes = require('./auth');
 const userRoutes = require('./user');
 const chatRoutes = require('./chat');
+const messageRoutes = require('./message');
 const callRoutes = require('./call');
 const discoveryRoutes = require('./discovery');
 const groupRoutes = require('./group');
@@ -12,7 +13,7 @@ const storyRoutes = require('./story');
 const adminRoutes = require('./admin');
 const analyticsRoutes = require('./analytics');
 
-// Health check route
+// Health check endpoint
 router.get('/health', (req, res) => {
   res.json({
     status: 'OK',
@@ -35,6 +36,7 @@ router.get('/version', (req, res) => {
 router.use('/auth', authRoutes);
 router.use('/users', userRoutes);
 router.use('/chats', chatRoutes);
+router.use('/messages', messageRoutes);
 router.use('/calls', callRoutes);
 router.use('/discovery', discoveryRoutes);
 router.use('/groups', groupRoutes);
@@ -46,7 +48,7 @@ router.use('/analytics', analyticsRoutes);
 router.use('*', (req, res) => {
   res.status(404).json({
     success: false,
-    message: 'API endpoint not found',
+    message: 'Route not found',
     path: req.originalUrl,
     method: req.method
   });
